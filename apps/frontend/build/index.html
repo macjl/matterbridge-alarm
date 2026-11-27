@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="fr">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="light dark"><title>Alarme · Matterbridge</title><link rel="stylesheet" href="./style.css"><script src="./ui.js" defer></script><script src="./app.js" defer></script></head>
+<body><a class="skip-link" href="#panel-overview">Aller au contenu</a><main>
+<header class="page-header"><div><a class="brand" href="/" target="_top">Matterbridge</a><h1>Alarme</h1><p class="subtitle">Modes, zones et actions pour une surveillance locale.</p></div><button id="refresh" type="button" class="secondary">Actualiser</button></header>
+<p id="auth-message" class="notice" hidden>La connexion Matterbridge est nécessaire. <a href="/" target="_top">Ouvrir Matterbridge</a>, puis actualiser cette page.</p>
+<p id="message" class="feedback" role="status" aria-live="polite"></p>
+<div id="configuration" hidden><nav class="section-nav" role="tablist" aria-label="Configuration"><button type="button" role="tab" id="tab-overview" aria-controls="panel-overview" aria-selected="true" tabindex="0" data-panel="overview">Vue d’ensemble</button><button type="button" role="tab" id="tab-modes" aria-controls="panel-modes" aria-selected="false" tabindex="-1" data-panel="modes">Modes</button><button type="button" role="tab" id="tab-zones" aria-controls="panel-zones" aria-selected="false" tabindex="-1" data-panel="zones">Zones</button><button type="button" role="tab" id="tab-rules" aria-controls="panel-rules" aria-selected="false" tabindex="-1" data-panel="rules">Déclencheurs</button><button type="button" role="tab" id="tab-actions" aria-controls="panel-actions" aria-selected="false" tabindex="-1" data-panel="actions">Actions</button><button type="button" role="tab" id="tab-devices" aria-controls="panel-devices" aria-selected="false" tabindex="-1" data-panel="devices">Appareils</button><button type="button" role="tab" id="tab-settings" aria-controls="panel-settings" aria-selected="false" tabindex="-1" data-panel="settings">Réglages</button><button type="button" role="tab" id="tab-history" aria-controls="panel-history" aria-selected="false" tabindex="-1" data-panel="history">Journal</button></nav><div role="tabpanel" id="panel-overview" aria-labelledby="tab-overview"><section class="overview-card">
+          <h2>État de l’alarme</h2><div class="metrics"><div><span>Modes</span><strong id="mode-count">—</strong></div><div><span>Zones</span><strong id="zone-count">—</strong></div><div><span>Déclencheurs</span><strong id="rule-count">—</strong></div></div>
+          <p id="alarm-status" role="status"></p>
+          <p id="zone-status"></p>
+          <p id="actions-status" role="status"></p>
+          <div id="mode-shortcuts" class="button-row" role="group" aria-label="Choisir un mode"></div><button id="disarm">Désarmer</button>
+          <p class="hint">Dans Maison, les commandes Désarmer et les modes sont regroupés dans l’accessoire Alarme. Le détecteur « Alarme déclenchée » signale une intrusion.</p>
+        </section></div><div role="tabpanel" id="panel-modes" aria-labelledby="tab-modes" hidden><section>
+          <h2>Modes</h2>
+          <h3>Désarmer</h3>
+          <form id="disarm-actions-form">
+            <fieldset><legend>Actions au désarmement</legend><div id="disarm-actions"></div></fieldset>
+            <button>Enregistrer les actions de Désarmer</button>
+          </form>
+          <p><small>Ces actions sont exécutées au passage à l’état désarmé, quel que soit le mode précédent.</small></p>
+          <h3>Modes de surveillance</h3>
+          <ul id="modes"></ul>
+          <details class="editor"><summary>Créer un mode</summary><form id="mode-form">
+            <label>Nom <input name="name" maxlength="27" placeholder="Away, Night, Holiday…" required></label>
+            <label>Délai d’activation (s) <input type="number" name="activationSeconds" min="0" max="86400" value="30" required></label>
+            <label>Délai avant déclenchement (s) <input type="number" name="triggerSeconds" min="0" max="86400" value="20" required></label>
+            <label>Durée d’alarme avant retour à l’état armé (s) <input type="number" name="alarmSeconds" min="0" max="86400" value="120" required></label>
+            <small>Une durée d’alarme de 0 maintient l’alarme déclenchée jusqu’au désarmement. Au retour à l’état armé, une condition encore anormale peut déclencher une nouvelle alerte.</small>
+            <fieldset><legend>Zones surveillées</legend><div id="mode-zones"></div></fieldset>
+            <fieldset><legend>Actions par état</legend><div id="mode-actions"></div></fieldset>
+            <small>Le pré-armement correspond au délai d’activation. Un délai nul passe directement à l’état armé. Une condition déjà anormale peut ensuite lancer immédiatement la pré-alarme ou l’alarme.</small>
+            <button class="save">Ajouter le mode</button>
+            <button class="cancel" type="button" hidden>Annuler</button>
+          </form></details>
+        </section></div><div role="tabpanel" id="panel-zones" aria-labelledby="tab-zones" hidden><section>
+          <h2>Zones</h2>
+          <ul id="zones"></ul>
+          <details class="editor"><summary>Créer une zone</summary><form id="zone-form">
+            <label>Nom <input name="name" maxlength="80" placeholder="RDC, garage…" required></label>
+            <fieldset><legend>Actions par état</legend><div id="zone-actions"></div></fieldset>
+            <button class="save">Ajouter la zone</button>
+            <button class="cancel" type="button" hidden>Annuler</button>
+          </form></details>
+        </section></div><div role="tabpanel" id="panel-rules" aria-labelledby="tab-rules" hidden><section>
+          <h2>Déclencheurs</h2>
+          <p>Choisis un accessoire puis son état ou son changement d’état. Un état déjà présent peut déclencher à l’armement. Un événement attend un changement pendant la surveillance.</p>
+          <ul id="rules"></ul>
+          <details class="editor"><summary>Créer un déclencheur</summary><form id="rule-form">
+            <label>Nom <input name="name" maxlength="80" placeholder="Lumière allumée…" required></label>
+            <fieldset><legend>Zones concernées</legend><div id="rule-zones"></div></fieldset>
+            <label>Accessoire <select name="device" required></select></label>
+            <label>Détection <select name="signal" required></select></label>
+            <label>Déclencheur <select name="trigger" required></select></label>
+            <p id="rule-state" role="status"></p>
+            <small>Les changements portent sur marche/arrêt, ouverture/fermeture ou détection/absence. Un changement pendant le pré-armement est ignoré. Une reconnexion rétablit la référence des événements.</small>
+            <button class="save">Ajouter le déclencheur</button>
+            <button class="cancel" type="button" hidden>Annuler</button>
+          </form></details>
+        </section></div><div role="tabpanel" id="panel-actions" aria-labelledby="tab-actions" hidden><section>
+          <h2>Actions</h2>
+          <p>Une action regroupe des commandes exécutées dans l’ordre. Associe-la ensuite aux états des modes et des zones, ou au mode Désarmer.</p>
+          <p class="hint">Pour un son, choisir « Lire un profil » sur le lecteur Audio. Prévoir une action d’arrêt au désarmement et au retour à l’état armé. Une action peut être exécutée manuellement lorsque l’alarme est désarmée.</p>
+          <ul id="actions"></ul>
+          <details class="editor"><summary>Créer une action</summary><form id="action-form">
+            <label>Nom <input name="name" maxlength="80" placeholder="Éclairer le rez-de-chaussée…" required></label>
+            <ol id="action-steps"></ol>
+            <button id="add-action-step" type="button">Ajouter une commande</button>
+            <small>Les commandes proposées dépendent de l’accessoire. La luminosité peut allumer la lampe. La couleur et la température du blanc conservent sa luminosité.</small>
+            <button class="save">Ajouter l’action</button>
+            <button class="cancel" type="button" hidden>Annuler</button>
+          </form></details>
+        </section></div><div role="tabpanel" id="panel-devices" aria-labelledby="tab-devices" hidden><section>
+          <h2>Appareils Matter</h2>
+          <ul id="peers"></ul>
+          <form id="pair-device">
+            <label>Code de partage Matter <input name="code" type="password" inputmode="numeric" autocomplete="off" maxlength="30" required></label>
+            <button>Jumeler un appareil</button>
+            <small>Ouvre le mode de jumelage de l’appareil dans Maison et colle le code temporaire ici.</small>
+          </form>
+        </section></div><div role="tabpanel" id="panel-settings" aria-labelledby="tab-settings" hidden><section>
+          <h2>Réglages</h2>
+          <form id="settings">
+            <label class="check"><input type="checkbox" name="homeDisarm"> Autoriser le désarmement depuis Maison</label>
+            <fieldset><legend>Contrôleurs Matter autorisés à désarmer indépendamment de Maison</legend><div id="trusted-controllers"></div><small>Choisis par exemple le contrôleur du plugin clavier. Cette autorisation suit son identité Matter et survit au redémarrage.</small></fieldset>
+            <label class="check"><input type="checkbox" name="detector"> Publier le capteur de présence « Alarme déclenchée » dans Maison</label>
+            <p class="hint">Les sons se configurent dans le plugin Audio et se lancent avec les actions « Lire un profil ».</p>
+            <button>Enregistrer les réglages</button>
+          </form>
+        </section></div><div role="tabpanel" id="panel-history" aria-labelledby="tab-history" hidden><section>
+          <h2>Journal</h2>
+          <ol id="history"></ol>
+        </section></div></div>
+<footer>Configuration enregistrée localement · <a href="https://github.com/macjl/matterbridge-alarm" target="_blank" rel="noopener noreferrer">Documentation et suivi</a></footer>
+</main></body></html>

@@ -1,0 +1,4 @@
+services:
+  matterbridge:
+    devices:
+      - /dev/snd:/dev/snd

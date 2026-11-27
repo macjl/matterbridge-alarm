@@ -1,0 +1,13 @@
+*
+!package.json
+!index.js
+!alarm.js
+!attributes.js
+!actions.js
+!content.js
+!siren.js
+!docker-start.sh
+!apps/
+!apps/frontend/
+!apps/frontend/build/
+!apps/frontend/build/**
