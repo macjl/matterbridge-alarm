@@ -266,10 +266,10 @@ function renderActionChoices(kind, actions) {
 }
 
 function operationLabel(operation) {
-  const choice = current?.peers.find((p) => p.id === operation.peer)?.endpoints.find((e) => e.number === operation.endpoint)
-    ?.commands.find((c) => c.id === operation.command)?.choices?.find((c) => c.value === operation.value);
+  const target = current?.peers.find((p) => p.id === operation.peer)?.endpoints.find((e) => e.number === operation.endpoint);
+  const choice = target?.commands.find((c) => c.id === operation.command)?.choices?.find((c) => c.value === operation.value);
   const value = operation.value === undefined ? '' : ' ' + (operation.command === 'profile' ? choice?.label ?? operation.valueLabel ?? 'Profil indisponible' : operation.value);
-  return `${operation.label || operation.peer} · ${commandNames[operation.command]}${value}`;
+  return `${target?.label || operation.label || operation.peer} · ${commandNames[operation.command]}${value}`;
 }
 
 function readActionSteps() {
