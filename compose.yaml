@@ -1,6 +1,6 @@
 services:
   matterbridge:
-    image: matterbridge-alarm:local
+    image: matterbridge-securitysystem-core:local
     build: .
     network_mode: host
     restart: unless-stopped

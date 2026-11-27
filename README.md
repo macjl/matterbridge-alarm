@@ -1,8 +1,8 @@
 # Matterbridge Alarme
 
-[![CI](https://github.com/macjl/matterbridge-alarm/actions/workflows/ci.yml/badge.svg)](https://github.com/macjl/matterbridge-alarm/actions/workflows/ci.yml)
+[![CI](https://github.com/macjl/matterbridge-securitysystem-core/actions/workflows/ci.yml/badge.svg)](https://github.com/macjl/matterbridge-securitysystem-core/actions/workflows/ci.yml)
 
-**Préversion 0.11.0-alpha.1 · Apache-2.0 · Matterbridge ≥ 3.11.2 · Node.js 24 recommandé**
+**Préversion 0.11.0-alpha.2 · Apache-2.0 · Matterbridge ≥ 3.11.2 · Node.js 24 recommandé**
 
 Un moteur d’alarme local qui lit des capteurs Matter et exécute des actions Matter. Les capteurs, le moteur et les actions ne nécessitent pas d’automatisation Apple Maison. Les appareils Thread dépendent toujours d’un routeur de bordure accessible.
 
@@ -25,25 +25,25 @@ Un événement « S’ouvre » attend une nouvelle ouverture ; une condition « 
 
 Ouvrir la page du plugin depuis Matterbridge, puis utiliser les onglets Modes, Zones, Déclencheurs, Actions et Appareils. Partager chaque appareil depuis son contrôleur existant avec un code de partage Matter ; la présence dans Maison seule ne l’ajoute pas à ce contrôleur.
 
-Les sons sont exclusivement des actions vers le [plugin Audio](https://github.com/macjl/matterbridge-audio). Associer un profil à chaque état et une action d’arrêt au désarmement ainsi qu’au retour à l’état armé. Le [plugin Clavier](https://github.com/macjl/matterbridge-keypad) peut armer et désarmer via Matter ; il peut recevoir une autorisation de désarmement indépendante de celle de Maison.
+Les sons sont exclusivement des actions vers le [plugin Audio](https://github.com/macjl/matterbridge-securitysystem-audio). Associer un profil à chaque état et une action d’arrêt au désarmement ainsi qu’au retour à l’état armé. Le [plugin Clavier](https://github.com/macjl/matterbridge-securitysystem-keypad) peut armer et désarmer via Matter ; il peut recevoir une autorisation de désarmement indépendante de celle de Maison.
 
 Le détecteur de présence est la présentation retenue pour le déclenchement. Le compagnon Homebridge avec une présentation native d’alarme et la simulation de présence sont des évolutions envisagées, non implémentées.
 
 ## Installation locale
 
 ```sh
-git clone https://github.com/macjl/matterbridge-alarm.git
-cd matterbridge-alarm
+git clone https://github.com/macjl/matterbridge-securitysystem-core.git
+cd matterbridge-securitysystem-core
 # Enregistrer le dossier dans une installation Matterbridge existante :
 matterbridge --add "$PWD"
 ```
 
-Le nom technique du plugin reste **`matterbridge-hybrid-poc`** pour conserver les données et identités du prototype installé. La page est `/plugins/matterbridge-hybrid-poc/` sur le serveur web Matterbridge. Se connecter à Matterbridge avant de l’ouvrir ; aucune clé supplémentaire n’est requise. Les API sont protégées par Matterbridge et une version antérieure à 3.11.2 est refusée.
+La page de configuration se trouve à `/plugins/matterbridge-securitysystem-core/` sur le serveur web Matterbridge. Se connecter à Matterbridge avant de l’ouvrir ; aucune clé supplémentaire n’est requise. Les API sont protégées par Matterbridge et une version antérieure à 3.11.2 est refusée.
 
 ## Docker
 
 ```sh
-docker build -t matterbridge-alarm:local .
+docker build -t matterbridge-securitysystem-core:local .
 docker compose up -d --no-build
 ```
 
