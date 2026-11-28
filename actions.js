@@ -1,6 +1,6 @@
 import { ColorControlClient, LevelControlClient, MediaPlaybackClient, OnOffClient } from 'matterbridge/matter/behaviors';
 import { ColorControl, LevelControl, MediaPlayback, OnOff } from 'matterbridge/matter/clusters';
-import { hasAudioProfiles, playAudioProfile } from './content.js';
+import { hasAudioMasterVolume, hasAudioProfiles, playAudioProfile, setAudioMasterVolume } from './content.js';
 
 const definitions = {
   on: { label: 'Allumer', client: OnOffClient, cluster: OnOff, command: 'on' },
@@ -55,8 +55,10 @@ export function commandsOf(endpoint, profiles = []) {
 
 export function validOperation(operation) {
   const { peer, endpoint, command, value } = operation ?? {};
-  if (typeof peer !== 'string' || !Number.isInteger(endpoint) || endpoint < 1 || endpoint > 65534 || (command !== 'profile' && !Object.hasOwn(definitions, command))) return false;
+  if (typeof peer !== 'string' || !Number.isInteger(endpoint) || endpoint < 1 || endpoint > 65534) return false;
   if (command === 'profile') return typeof value === 'string' && /^[a-z0-9-]{1,40}$/.test(value);
+  if (command === 'master-volume') return Number.isInteger(value) && value >= 0 && value <= 100;
+  if (!Object.hasOwn(definitions, command)) return false;
   if (noValue.has(command)) return value === undefined;
   if (command === 'color') return typeof value === 'string' && /^#[0-9a-f]{6}$/i.test(value);
   return Number.isInteger(value) && (['brightness', 'volume'].includes(command) ? value >= 0 && value <= 100 : value >= 1000 && value <= 20000);
@@ -66,6 +68,11 @@ export async function executeOperation(controller, operation) {
   const peer = controller.peers.get(operation.peer);
   const endpoint = peer?.endpoints.find(({ number }) => number === operation.endpoint);
   if (!peer?.lifecycle.isConnected || !endpoint) throw new Error('Appareil Matter indisponible.');
+  if (operation.command === 'master-volume') {
+    if (!hasAudioMasterVolume(endpoint)) throw new Error('Commande indisponible sur cet accessoire.');
+    await setAudioMasterVolume(endpoint, operation.value);
+    return;
+  }
   const capability = commandsOf(endpoint).find(({ id }) => id === operation.command);
   if (!capability) throw new Error('Commande indisponible sur cet accessoire.');
   if (capability.min !== undefined && (operation.value < capability.min || operation.value > capability.max)) {

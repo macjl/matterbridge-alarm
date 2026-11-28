@@ -5,20 +5,30 @@ import {
   MatterbridgeDynamicPlatform,
   MatterbridgeEndpoint,
   bridgedNode,
+  doorLock,
   occupancySensor,
   onOffPlugInUnit,
 } from 'matterbridge';
 import { ChangeNotificationService, ClientNode, ControllerBehavior, NetworkClient, Seconds, ServerNode } from 'matterbridge/matter';
-import { BasicInformationClient, BridgedDeviceBasicInformationClient, DescriptorServer } from 'matterbridge/matter/behaviors';
-import { Descriptor, OccupancySensing, OnOff } from 'matterbridge/matter/clusters';
+import { BasicInformationClient, BridgedDeviceBasicInformationClient, DoorLockServer, FixedLabelServer } from 'matterbridge/matter/behaviors';
+import { BridgedDeviceBasicInformation, Descriptor, DoorLock, FixedLabel, OccupancySensing, OnOff } from 'matterbridge/matter/clusters';
 import { ManualPairingCodeCodec, StatusResponse } from 'matterbridge/matter/types';
 import { Alarm, integerIn } from './alarm.js';
-import { isSupportedRule, normalizeRule, signalsOf } from './attributes.js';
+import { isSupportedRule, signalsOf } from './attributes.js';
 import { commandsOf, executeOperation, validOperation } from './actions.js';
 import { hasAudioProfiles, readAudioProfiles } from './content.js';
 
-const apiActions = new Set(['status', 'pair-device', 'share-device', 'remove-device', 'settings', 'disarm-actions', 'zone', 'remove-zone', 'rule', 'remove-rule', 'mode', 'remove-mode', 'action', 'remove-action', 'test-action', 'arm']);
-const actionEvents = ['exit', 'armed', 'entry', 'triggered'];
+const apiActions = new Set([
+  'status', 'pair-device', 'share-device', 'rename-device', 'remove-device', 'settings', 'arm',
+  'rule', 'remove-rule', 'zone', 'remove-zone', 'action', 'remove-action', 'test-action',
+  'scenario', 'remove-scenario', 'test-scenario', 'mode', 'remove-mode',
+]);
+const modePhases = ['exit', 'armed', 'entry', 'triggered', 'disarmed'];
+const modePresentations = {
+  switches: { type: onOffPlugInUnit, groupId: 'alarm-mode-selector', modePrefix: 'alarm-mode-', name: 'Alarme' },
+  locks: { type: doorLock, groupId: 'alarm-lock-selector', modePrefix: 'alarm-lock-mode-', name: 'Alarme (serrures)' },
+};
+const lockCommands = new WeakMap();
 
 export default function initialize(matterbridge, log, config) {
   return new HybridPoc(matterbridge, log, config);
@@ -29,7 +39,7 @@ class HybridPoc extends MatterbridgeDynamicPlatform {
   changes;
   configuring = false;
   activePeers = new Set();
-  modeSwitches = new Map();
+  modeGroups = new Map();
   profileCatalogs = new Map();
   profilesRefreshedAt = 0;
 
@@ -42,80 +52,102 @@ class HybridPoc extends MatterbridgeDynamicPlatform {
       onError: (error) => this.reportError(error),
     });
     await this.alarm.start();
-    await this.registerDisarmSwitch();
     await this.syncAccessories();
     await this.startController();
     this.schedulePublication();
   }
 
-  async registerDisarmSwitch() {
-    // The parent is an application endpoint too. Its On/Off control is Désarmer.
-    // A new identity avoids reusing the container-only endpoint cached by Home.
-    const device = new MatterbridgeEndpoint([onOffPlugInUnit, bridgedNode], { id: 'alarm-mode-selector', tagList: modeTags('Désarmer', 0) })
-      .createDefaultBridgedDeviceBasicInformationClusterServer('Alarme', 'alarm-mode-selector')
-      .createDefaultOnOffClusterServer(this.alarm.record.state.phase === 'disarmed')
-      .addRequiredClusters();
-    this.modeAccessory = device;
-    device.addCommandHandler('OnOff.on', async ({ context }) => {
-      const error = await this.alarm.disarm(this.matterSource(context));
-      if (error) throw new StatusResponse.FailureError(error);
-    });
-    device.addCommandHandler('OnOff.off', () => {
-      if (this.alarm.record.state.phase === 'disarmed') {
-        throw new StatusResponse.FailureError('Active un mode pour armer l’alarme.');
-      }
-    });
-    rejectAlternativeCommands(device);
-    // Include the complete initial composition in the first descriptor Home reads.
-    for (const [index, mode] of this.alarm.record.modes.entries()) {
-      const child = this.createModeSwitch(mode, index);
-      device.parts.add(child);
-      this.modeSwitches.set(mode.id, child);
+  createModeControl(kind, mode, index, number) {
+    const { type, groupId, modePrefix, name } = modePresentations[kind];
+    const id = mode ? modePrefix + mode.id : groupId;
+    const label = mode?.name ?? 'Désarmer';
+    const tagList = modeTags(label, index);
+    // Maison discovers children when the parent also has an application device type.
+    const device = new MatterbridgeEndpoint(mode ? type : [type, bridgedNode], { id, tagList, number });
+    if (mode) device.deviceName = mode.name;
+    else device.createDefaultBridgedDeviceBasicInformationClusterServer(name, groupId);
+    const { state } = this.alarm.record;
+    const active = mode ? state.modeId === mode.id : state.phase === 'disarmed';
+    const command = (activate, context) => this.commandModeControl(mode?.id, activate, context);
+    if (kind === 'locks') {
+      lockCommands.set(device, command);
+      device.behaviors.require(AlarmModeLockServer, {
+        lockState: lockState(active), lockType: DoorLock.LockType.DeadBolt, actuatorEnabled: true,
+        operatingMode: DoorLock.OperatingMode.Normal,
+      });
+      device.behaviors.require(FixedLabelServer, { labelList: lockLabels(label) });
+    } else {
+      device.createDefaultOnOffClusterServer(active);
+      device.addCommandHandler('OnOff.on', ({ context }) => command(true, context));
+      device.addCommandHandler('OnOff.off', ({ context }) => command(false, context));
+      rejectAlternativeCommands(device);
     }
-    await this.registerDevice(this.modeAccessory);
-    this.modeAccessory.stateOf(DescriptorServer);
-    device.stateOf('onOff');
-    this.disarmSwitch = device;
-    await device.setAttribute(OnOff, 'onOff', this.alarm.record.state.phase === 'disarmed', this.log);
+    return device.addRequiredClusters();
   }
 
-  createModeSwitch(mode, index) {
-    const id = `alarm-mode-${mode.id}`;
-    const device = new MatterbridgeEndpoint(onOffPlugInUnit, { id, tagList: modeTags(mode.name, index + 1) })
-      .createDefaultOnOffClusterServer(this.alarm.record.state.modeId === mode.id)
-      .addRequiredClusters();
-    device.deviceName = mode.name;
-    for (const [command, activate] of [['on', true], ['off', false]]) {
-      device.addCommandHandler(`OnOff.${command}`, async ({ context }) => {
-        const error = await this.alarm.command(mode.id, activate, this.matterSource(context));
-        if (error) throw new StatusResponse.FailureError(error);
-      });
+  async commandModeControl(modeId, activate, context) {
+    const source = this.matterSource(context);
+    let error;
+    if (modeId) error = await this.alarm.command(modeId, activate, source);
+    else if (activate) error = await this.alarm.disarm(source);
+    else if (this.alarm.record.state.phase === 'disarmed') error = 'Active un mode pour armer l’alarme.';
+    if (error) throw new StatusResponse.FailureError(error);
+  }
+
+  async syncModeGroup(kind, enabled, modes) {
+    const group = this.modeGroups.get(kind);
+    const numbersKey = `alarmModeNumbers:${this.matterbridge.bridgeMode}:${kind}`;
+    if (!enabled) {
+      if (group) {
+        // Unregistering erases Matterbridge's endpoint allocation. Keep it for this same group.
+        await this.context.set(numbersKey, {
+          parent: group.parent.number,
+          modes: Object.fromEntries([...group.controls].map(([id, device]) => [id, device.number])),
+        });
+        await this.unregisterDevice(group.parent);
+        this.modeGroups.delete(kind);
+      }
+      return;
     }
-    rejectAlternativeCommands(device);
-    return device;
+    if (!group) {
+      const numbers = await this.context.get(numbersKey, {});
+      const parent = this.createModeControl(kind, undefined, 0, numbers.parent);
+      const controls = new Map();
+      // Publish the complete composition in the first descriptor a controller reads.
+      for (const [index, mode] of modes.entries()) {
+        const device = this.createModeControl(kind, mode, index + 1, numbers.modes?.[mode.id]);
+        parent.parts.add(device);
+        controls.set(mode.id, device);
+      }
+      await this.registerDevice(parent);
+      this.bridgeRoot = parent.ownerOfType(ServerNode.RootEndpoint);
+      if (kind === 'locks') await parent.setAttribute(BridgedDeviceBasicInformation, 'nodeLabel', 'Désarmer', this.log);
+      this.modeGroups.set(kind, { parent, controls });
+      return;
+    }
+    const { parent, controls } = group;
+    for (const [id, device] of controls) {
+      if (modes.some((mode) => mode.id === id)) continue;
+      await device.delete();
+      controls.delete(id);
+    }
+    for (const [index, mode] of modes.entries()) {
+      let device = controls.get(mode.id);
+      if (!device) {
+        device = this.createModeControl(kind, mode, index + 1);
+        await parent.add(device);
+        controls.set(mode.id, device);
+      }
+      await device.setAttribute(Descriptor, 'tagList', modeTags(mode.name, index + 1));
+      if (kind === 'locks') await device.setAttribute(FixedLabel, 'labelList', lockLabels(mode.name), this.log);
+      device.deviceName = mode.name;
+    }
   }
 
   async syncAccessories() {
     const { modes, settings } = this.alarm.record;
-    for (const [id, device] of this.modeSwitches) {
-      if (modes.some((mode) => mode.id === id)) continue;
-      await device.delete();
-      this.modeSwitches.delete(id);
-    }
-    for (const [index, mode] of modes.entries()) {
-      const label = mode.name;
-      const tagList = modeTags(label, index + 1);
-      let device = this.modeSwitches.get(mode.id);
-      if (!device) {
-        device = this.createModeSwitch(mode, index);
-        // Build the child completely before adding it to the live composed accessory.
-        await this.modeAccessory.add(device);
-        this.modeSwitches.set(mode.id, device);
-      }
-      await device.setAttribute(Descriptor, 'tagList', tagList);
-      await device.setAttribute(OnOff, 'onOff', this.alarm.record.state.modeId === mode.id, this.log);
-      device.deviceName = label;
-    }
+    await this.syncModeGroup('switches', settings.exposeSwitches, modes);
+    await this.syncModeGroup('locks', settings.exposeLocks, modes);
     if (settings.detector && !this.alarmDetector) {
       const device = new MatterbridgeEndpoint([occupancySensor, bridgedNode], { id: 'alarm-occupancy' })
         .createDefaultBridgedDeviceBasicInformationClusterServer('Alarme déclenchée', 'alarm-occupancy')
@@ -123,6 +155,7 @@ class HybridPoc extends MatterbridgeDynamicPlatform {
         .addRequiredClusters();
       await this.registerDevice(device);
       this.alarmDetector = device;
+      this.bridgeRoot = device.ownerOfType(ServerNode.RootEndpoint);
     } else if (!settings.detector && this.alarmDetector) {
       await this.unregisterDevice(this.alarmDetector);
       this.alarmDetector = undefined;
@@ -139,8 +172,16 @@ class HybridPoc extends MatterbridgeDynamicPlatform {
     this.published = (this.published ?? Promise.resolve()).then(async () => {
       await new Promise((resolve) => setImmediate(resolve));
       if (this.shuttingDown) return;
-      for (const [id, device] of this.modeSwitches) await device.setAttribute(OnOff, 'onOff', modeId === id, this.log);
-      await this.disarmSwitch?.setAttribute(OnOff, 'onOff', phase === 'disarmed', this.log);
+      const switches = this.modeGroups.get('switches');
+      if (switches) {
+        for (const [id, device] of switches.controls) await device.setAttribute(OnOff, 'onOff', modeId === id, this.log);
+        await switches.parent.setAttribute(OnOff, 'onOff', phase === 'disarmed', this.log);
+      }
+      const locks = this.modeGroups.get('locks');
+      if (locks) {
+        for (const [id, device] of locks.controls) await publishLockState(device, modeId === id);
+        await publishLockState(locks.parent, phase === 'disarmed');
+      }
       await this.alarmDetector?.setAttribute(OccupancySensing, 'occupancy', { occupied: phase === 'triggered' }, this.log);
     }).catch((error) => this.reportError(error));
   }
@@ -185,8 +226,9 @@ class HybridPoc extends MatterbridgeDynamicPlatform {
       const error = await this.configure(path, body);
       if (error) return { error };
       if (['mode', 'remove-mode', 'settings'].includes(path)) {
-        await this.published;
-        await this.syncAccessories();
+        const sync = (this.published ?? Promise.resolve()).then(() => this.syncAccessories());
+        this.published = sync.catch((failure) => this.reportError(failure));
+        await sync;
       }
       if (path === 'pair-device') await this.refreshProfiles(true);
       return this.status();
@@ -200,34 +242,69 @@ class HybridPoc extends MatterbridgeDynamicPlatform {
       alarm: this.alarm.view,
       controllers: this.controllers(),
       accessories: {
-        modes: {
-          name: 'Alarme', endpoint: this.modeAccessory.maybeNumber,
-          parts: this.modeAccessory.getAttribute(Descriptor, 'partsList'),
-          switches: [
-            { modeId: null, name: 'Désarmer', endpoint: this.disarmSwitch.maybeNumber },
-            ...this.alarm.record.modes.map((mode) => ({ modeId: mode.id, name: mode.name, endpoint: this.modeSwitches.get(mode.id)?.maybeNumber })),
-          ],
-        },
+        modes: this.modeGroupStatus('switches'),
+        ...(this.modeGroups.has('locks') ? { locks: this.modeGroupStatus('locks') } : {}),
       },
       actionRunning: Boolean(this.runningActions),
-      peers: this.controller.peers.commissioned.map((peer) => ({
-        id: peer.id,
-        label: peer.maybeStateOf(BasicInformationClient)?.nodeLabel || peer.maybeStateOf(BasicInformationClient)?.productName || peer.id,
-        connected: this.activePeers.has(peer),
-        endpoints: peer.endpoints.map((endpoint) => ({
-          number: endpoint.number, label: this.endpointLabel(peer, endpoint),
+      peers: this.deviceStatus(),
+    };
+  }
+
+  modeGroupStatus(kind) {
+    const group = this.modeGroups.get(kind);
+    if (!group) return null;
+    const { parent, controls } = group;
+    return {
+      name: modePresentations[kind].name,
+      endpoint: parent.maybeNumber,
+      parts: parent.getAttribute(Descriptor, 'partsList'),
+      [kind]: [
+        { modeId: null, name: 'Désarmer', endpoint: parent.maybeNumber },
+        ...this.alarm.record.modes.map(({ id, name }) => ({ modeId: id, name, endpoint: controls.get(id)?.maybeNumber })),
+      ],
+    };
+  }
+
+  deviceStatus() {
+    const devices = this.controller.peers.commissioned.map((peer) => {
+      const info = peer.maybeStateOf(BasicInformationClient);
+      const originalLabel = info?.nodeLabel || info?.productName || peer.id;
+      const customName = this.alarm.record.deviceNames[peer.id] ?? '';
+      return { peer, originalLabel, customName, name: customName || originalLabel, serialNumber: info?.serialNumber?.trim() || null };
+    });
+    const counts = new Map();
+    for (const { name } of devices) counts.set(name, (counts.get(name) ?? 0) + 1);
+
+    return devices.map(({ peer, originalLabel, customName, name, serialNumber }) => {
+      const label = counts.get(name) > 1 ? `${name} · ${peer.id}` : name;
+      const connected = this.activePeers.has(peer);
+      const endpoints = peer.endpoints.map((endpoint) => {
+        const info = endpoint.maybeStateOf(BridgedDeviceBasicInformationClient);
+        const bridge = info ?? bridgedInfo(endpoint);
+        const nativeLabel = this.endpointLabel(peer, endpoint);
+        const accessoryLabel = nativeLabel || `Accessoire ${endpoint.number}`;
+        const customName = this.customEndpointName(peer, endpoint);
+        let endpointName = label;
+        if (bridge) endpointName = `${customName || accessoryLabel} · ${label}`;
+        else if (nativeLabel && nativeLabel !== originalLabel) {
+          endpointName = label === originalLabel ? nativeLabel : `${nativeLabel} · ${label}`;
+        }
+        return {
+          number: endpoint.number, label: endpointName,
+          bridged: Boolean(bridge), bridgeDevice: Boolean(info), customName, originalLabel: accessoryLabel,
+          serialNumber: info?.serialNumber?.trim() || null, connected: connected && bridge?.reachable !== false,
           signals: signalsOf(endpoint).map((signal) => ({
             ...signal, value: this.alarm.values.get(peer.id)?.get(endpoint.number)?.get(signal.id) ?? null,
           })),
           commands: commandsOf(endpoint, this.profileCatalogs.get(`${peer.id}:${endpoint.number}`)),
-        })).filter(({ signals, commands }) => signals.length || commands.length),
-      })),
-    };
+        };
+      }).filter(({ signals, commands, bridgeDevice }) => signals.length || commands.length || bridgeDevice);
+      return { id: peer.id, label, originalLabel, customName, serialNumber, connected, endpoints };
+    });
   }
 
   controllers() {
-    const root = this.modeAccessory.ownerOfType(ServerNode.RootEndpoint);
-    return (root?.stateOf('operationalCredentials').fabrics ?? []).map((fabric) => ({
+    return (this.bridgeRoot?.stateOf('operationalCredentials').fabrics ?? []).map((fabric) => ({
       id: controllerId(fabric), label: fabric.label || 'Contrôleur Matter',
       trusted: (this.alarm.record.settings.trustedControllers ?? []).includes(controllerId(fabric)),
     }));
@@ -241,49 +318,54 @@ class HybridPoc extends MatterbridgeDynamicPlatform {
 
   async configure(action, body) {
     if (action === 'test-action') return this.alarm.testAction(body.id);
-    if (action === 'disarm-actions') {
-      const bindings = this.actionBindings({ disarmed: body.actions }, ['disarmed']);
-      if (!bindings || !Array.isArray(body.actions)) return 'Vérifie les actions du mode Désarmer.';
-      return this.alarm.configure((record) => ({ ...record, disarmActions: bindings.disarmed }));
-    }
+    if (action === 'test-scenario') return this.alarm.testScenario(body.id);
     if (action === 'settings') return this.alarm.saveSettings(body);
     if (action === 'remove-zone') return this.alarm.removeItem('zones', body.id);
     if (action === 'remove-rule') return this.alarm.removeItem('rules', body.id);
     if (action === 'remove-mode') return this.alarm.removeItem('modes', body.id);
     if (action === 'remove-action') return this.alarm.removeItem('actions', body.id);
-    if (['zone', 'rule', 'mode', 'action'].includes(action)) {
+    if (action === 'remove-scenario') return this.alarm.removeItem('scenarios', body.id);
+    if (['zone', 'rule', 'mode', 'action', 'scenario'].includes(action)) {
       const name = typeof body.name === 'string' ? body.name.trim() : '';
       if (!name || name.length > 80) return 'Renseigne un nom valide.';
       if (body.id !== undefined && typeof body.id !== 'string') return 'Identifiant invalide.';
       const item = { id: body.id ?? randomUUID().replaceAll('-', ''), editing: body.id !== undefined, name };
       if (action === 'rule') return this.saveRule(item, body);
       if (action === 'action') return this.saveAction(item, body);
-      const bindings = this.actionBindings(body.actions);
-      if (!bindings) return 'Vérifie les actions associées aux événements.';
-      item.actions = bindings;
-      if (action === 'zone') return this.alarm.saveItem('zones', item);
+      if (action === 'zone') {
+        const ruleIds = selection(body.ruleIds);
+        if (!ruleIds) return 'Vérifie les déclencheurs de la zone.';
+        return this.alarm.saveItem('zones', { ...item, ruleIds });
+      }
+      if (action === 'scenario') {
+        const actionIds = selection(body.actionIds);
+        if (!actionIds?.length) return 'Sélectionne au moins une action pour ce scénario.';
+        return this.alarm.saveItem('scenarios', { ...item, actionIds });
+      }
       const savedMode = this.alarm.record.modes.find(({ id }) => id === item.id);
       const {
-        activationSeconds, triggerSeconds, zones, alarmSeconds = savedMode?.alarmSeconds ?? 120,
+        activationSeconds, triggerSeconds, alarmSeconds = savedMode?.alarmSeconds ?? 120,
       } = body;
-      if (Buffer.byteLength(name, 'utf8') > 27 || !Array.isArray(zones)
-        || !zones.every((id) => this.alarm.record.zones.some((zone) => zone.id === id))
+      const zones = selection(body.zones);
+      const scenarios = this.scenarioBindings(body.scenarios);
+      if (Buffer.byteLength(name, 'utf8') > 27 || !zones || !scenarios
         || !integerIn(activationSeconds, 0, 86400) || !integerIn(triggerSeconds, 0, 86400) || !integerIn(alarmSeconds, 0, 86400)) {
-        return 'Vérifie le nom du mode, les zones, les délais.';
+        return 'Vérifie le nom du mode, les zones, les délais et les scénarios.';
       }
-      return this.alarm.saveItem('modes', { ...item, activationSeconds, triggerSeconds, alarmSeconds, zones: [...new Set(zones)] });
+      return this.alarm.saveItem('modes', { ...item, activationSeconds, triggerSeconds, alarmSeconds, zones, scenarios });
     }
     if (action === 'pair-device') return this.pair(body.code);
+    if (action === 'rename-device') return this.renamePeer(body.peer, body.name, body.endpoint);
     if (action === 'remove-device') return this.removePeer(body.peer);
   }
 
-  actionBindings(input = {}, events = actionEvents) {
+  scenarioBindings(input = {}) {
     if (!input || typeof input !== 'object' || Array.isArray(input)) return;
     const bindings = {};
-    for (const event of events) {
-      const ids = input[event] ?? [];
-      if (!Array.isArray(ids) || !ids.every((id) => this.alarm.record.actions.some((action) => action.id === id))) return;
-      bindings[event] = [...new Set(ids)];
+    for (const phase of modePhases) {
+      const ids = selection(input[phase] ?? []);
+      if (!ids) return;
+      bindings[phase] = ids;
     }
     return bindings;
   }
@@ -305,7 +387,7 @@ class HybridPoc extends MatterbridgeDynamicPlatform {
       if (capability?.min !== undefined && (value < capability.min || value > capability.max)) return 'Valeur hors des limites de cet accessoire.';
       const choice = capability?.choices?.find((item) => item.value === value);
       if (command === 'profile' && !choice && saved?.value !== value) return 'Ce profil est indisponible. Actualise la liste des appareils.';
-      const label = (part && this.endpointLabel(node, part)) || saved?.label || peer;
+      const label = (part && (this.customEndpointName(node, part) || this.endpointLabel(node, part))) || saved?.label || peer;
       operations.push({ peer, endpoint, command, ...(value === undefined ? {} : { value }), label,
         ...(command === 'profile' ? { valueLabel: choice?.label ?? saved?.valueLabel ?? 'Profil indisponible' } : {}),
       });
@@ -345,11 +427,9 @@ class HybridPoc extends MatterbridgeDynamicPlatform {
   }
 
   saveRule(item, body) {
-    const rule = normalizeRule({ ...body, ...item });
-    const { zoneIds, peer, endpoint, signal, trigger } = rule;
-    if (!Array.isArray(zoneIds) || !zoneIds.length || !zoneIds.every((id) => this.alarm.record.zones.some((zone) => zone.id === id))
-      || typeof peer !== 'string' || !integerIn(endpoint, 1, 65534) || !isSupportedRule(rule)) {
-      return 'Sélectionne au moins une zone, un accessoire et un déclencheur.';
+    const { peer, endpoint, signal, trigger } = body;
+    if (typeof peer !== 'string' || !integerIn(endpoint, 1, 65534) || !isSupportedRule({ signal, trigger })) {
+      return 'Sélectionne un accessoire, une détection et une condition.';
     }
     const node = this.controller.peers.get(peer);
     const part = node?.endpoints.find(({ number }) => number === endpoint);
@@ -358,9 +438,9 @@ class HybridPoc extends MatterbridgeDynamicPlatform {
     const unchanged = previous?.peer === peer && previous.endpoint === endpoint && previous.signal === signal;
     if (!available && !unchanged) return 'Ce type de déclencheur est indisponible sur cet accessoire.';
     const kind = available?.kind ?? previous.kind;
-    const deviceLabel = (part && this.endpointLabel(node, part)) || previous?.deviceLabel || peer;
+    const deviceLabel = (part && (this.customEndpointName(node, part) || this.endpointLabel(node, part))) || previous?.deviceLabel || peer;
     return this.alarm.saveItem('rules', {
-      ...item, zoneIds: [...new Set(zoneIds)], peer, endpoint, signal, trigger, kind, deviceLabel,
+      ...item, peer, endpoint, signal, trigger, kind, deviceLabel,
     });
   }
 
@@ -407,6 +487,21 @@ class HybridPoc extends MatterbridgeDynamicPlatform {
       return 'Le retrait a échoué. Vérifie que l’appareil Matter est joignable.';
     }
     this.subscriptionChanged(peer, false);
+    await this.alarm.forgetDeviceNames(id);
+  }
+
+  renamePeer(id, input, number) {
+    const peer = typeof id === 'string' && this.controller.peers.get(id);
+    if (!peer?.lifecycle.isCommissioned) return 'Appareil Matter introuvable.';
+    if (typeof input !== 'string' || input.trim().length > 80 || /[\u0000-\u001f\u007f]/u.test(input)) return 'Renseigne un nom valide.';
+    if (number === undefined) return this.alarm.setDeviceName(id, input.trim());
+    const endpoint = peer.endpoints.find((part) => part.number === number);
+    if (!endpoint || !bridgedInfo(endpoint)) return 'Accessoire Matter introuvable.';
+    return this.alarm.setEndpointName(id, endpointNameKey(endpoint), input.trim());
+  }
+
+  customEndpointName(peer, endpoint) {
+    return this.alarm.record.endpointNames[peer.id]?.[endpointNameKey(endpoint)] ?? '';
   }
 
   observeSubscription(peer) {
@@ -460,7 +555,8 @@ class HybridPoc extends MatterbridgeDynamicPlatform {
   }
 
   endpointLabel(peer, endpoint) {
-    const direct = endpoint.maybeStateOf(BridgedDeviceBasicInformationClient)?.nodeLabel
+    const bridged = endpoint.maybeStateOf(BridgedDeviceBasicInformationClient);
+    const direct = bridged?.nodeLabel || bridged?.productName
       || endpoint.maybeStateOf(BasicInformationClient)?.nodeLabel
       || (endpoint.owner?.number === 0 ? (peer.maybeStateOf(BasicInformationClient)?.nodeLabel || peer.maybeStateOf(BasicInformationClient)?.productName) : '')
       || '';
@@ -495,6 +591,23 @@ class HybridPoc extends MatterbridgeDynamicPlatform {
   }
 }
 
+function bridgedInfo(endpoint) {
+  for (let part = endpoint; part?.number > 0; part = part.owner) {
+    const info = part.maybeStateOf(BridgedDeviceBasicInformationClient);
+    if (info) return info;
+  }
+}
+
+function endpointNameKey(endpoint) {
+  const uniqueId = endpoint.maybeStateOf(BridgedDeviceBasicInformationClient)?.uniqueId?.trim();
+  return uniqueId ? `device:${uniqueId}` : `endpoint:${endpoint.number}`;
+}
+
+function selection(ids) {
+  if (!Array.isArray(ids) || !ids.every((id) => typeof id === 'string')) return;
+  return [...new Set(ids)];
+}
+
 function rejectAlternativeCommands(device) {
   for (const command of ['toggle', 'offWithEffect', 'onWithRecallGlobalScene', 'onWithTimedOff']) {
     device.addCommandHandler(`OnOff.${command}`, () => {
@@ -506,6 +619,41 @@ function rejectAlternativeCommands(device) {
 function controllerId(fabric) {
   if (!fabric?.rootPublicKey || fabric.fabricId === undefined) return '';
   return createHash('sha256').update(Buffer.from(fabric.rootPublicKey)).update(String(fabric.fabricId)).digest('hex');
+}
+
+class AlarmModeLockServer extends DoorLockServer.enable({
+  events: { lockOperation: true, lockOperationError: true },
+}) {
+  async handleLockOperation({ actuation, source }) {
+    if (source !== DoorLock.OperationSource.Remote) {
+      throw new StatusResponse.FailureError('Utilise une commande explicite de mode.');
+    }
+    await lockCommands.get(this.endpoint)(actuation === 'lock', this.context);
+  }
+
+  publishState(locked) {
+    const next = lockState(locked);
+    if (this.state.lockState === next) return;
+    this.state.lockState = next;
+    this.events.lockOperation.emit({
+      lockOperationType: locked ? DoorLock.LockOperationType.Lock : DoorLock.LockOperationType.Unlock,
+      operationSource: DoorLock.OperationSource.Unspecified,
+      userIndex: null, fabricIndex: null, sourceNode: null, credentials: null,
+    }, this.context);
+  }
+}
+
+function lockState(locked) {
+  return locked ? DoorLock.LockState.Locked : DoorLock.LockState.Unlocked;
+}
+
+function publishLockState(device, locked) {
+  return device.act((agent) => agent.get(AlarmModeLockServer).publishState(locked));
+}
+
+function lockLabels(label) {
+  // Longer mode names are available in Descriptor.TagList.
+  return Buffer.byteLength(label, 'utf8') <= 16 ? [{ label: 'name', value: label }] : [];
 }
 
 function modeTags(label, index) {

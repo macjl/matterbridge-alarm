@@ -1,6 +1,6 @@
 {
   "name": "matterbridge-securitysystem-core",
-  "version": "0.11.0-alpha.2",
+  "version": "0.11.0-alpha.3",
   "description": "Local Matter alarm with a Matterbridge controller and configuration page",
   "type": "module",
   "main": "index.js",

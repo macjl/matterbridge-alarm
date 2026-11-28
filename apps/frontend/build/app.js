@@ -1,27 +1,35 @@
+const { t, serverText, profileName, language } = window.PluginUI;
 const $ = (selector) => document.querySelector(selector);
 const message = $('#message');
 const configuration = $('#configuration');
-const forms = { zone: $('#zone-form'), rule: $('#rule-form'), mode: $('#mode-form'), action: $('#action-form') };
+const forms = {
+  rule: $('#rule-form'), zone: $('#zone-form'), action: $('#action-form'),
+  scenario: $('#scenario-form'), mode: $('#mode-form'),
+};
 const ruleForm = forms.rule;
 const ruleFields = ruleForm.elements;
-const labels = { zone: 'la zone', rule: 'le déclencheur', mode: 'le mode', action: 'l’action' };
-const actionEvents = { exit: 'Pré-armement', armed: 'Armé', entry: 'Pré-alarme', triggered: 'Alarme' };
+const renameForm = $('#rename-device');
+const labels = { zone: t("the zone"), rule: t("the trigger"), mode: t("the mode"), action: t("the action"), scenario: t("the scenario") };
+const modePhases = { exit: t("Exit delay"), armed: t("Armed"), entry: t("Entry delay"), triggered: t("Alarm") };
+const scenarioPhases = { ...modePhases, disarmed: t("On disarm") };
 const commandNames = {
-  on: 'Allumer', off: 'Éteindre', brightness: 'Luminosité (%)', color: 'Couleur', temperature: 'Température du blanc (K)',
-  play: 'Lire / reprendre', pause: 'Mettre en pause', stop: 'Arrêter la lecture', volume: 'Volume (%)', mute: 'Couper le son', unmute: 'Rétablir le son',
-  profile: 'Lire un profil',
+  on: t("Turn on"), off: t("Turn off"), brightness: t("Brightness (%)"), color: t("Color"), temperature: t("White color temperature (K)"),
+  play: t("Play / resume"), pause: t("Pause playback"), stop: t("Stop playback"), volume: 'Volume (%)', mute: t("Mute"), unmute: t("Unmute"),
+  profile: t("Play a profile"), 'master-volume': t("Master volume (%)"),
 };
+const percentCommands = new Set(['brightness', 'volume', 'master-volume']);
 const settingsForm = $('#settings');
 const phases = {
-  disarmed: 'Désarmée', exit: 'Pré-armement', armed: 'Armée', entry: 'Pré-alarme', triggered: 'Alarme',
+  disarmed: t("Disarmed"), exit: t("Exit delay"), armed: t("Armed"), entry: t("Entry delay"), triggered: t("Alarm"),
 };
 const success = {
-  'pair-device': 'Appareil jumelé.', action: 'Action enregistrée.', 'remove-action': 'Action retirée.',
-  'remove-device': 'Appareil retiré.', zone: 'Zone enregistrée.', 'remove-zone': 'Zone retirée.',
-  mode: 'Mode enregistré.', 'remove-mode': 'Mode retiré.', rule: 'Déclencheur enregistré.', 'remove-rule': 'Déclencheur retiré.',
-  settings: 'Réglages enregistrés.',
-  'disarm-actions': 'Actions de Désarmer enregistrées.',
-  'test-action': 'Action lancée. Le résultat de chaque commande apparaît dans le journal.',
+  'pair-device': t("Device paired."), 'rename-device': t("Name saved."), action: t("Action saved."), 'remove-action': t("Action removed."),
+  'remove-device': t("Device removed."), zone: t("Zone saved."), 'remove-zone': t("Zone removed."),
+  mode: t("Mode saved."), 'remove-mode': t("Mode removed."), rule: t("Trigger saved."), 'remove-rule': t("Trigger removed."),
+  settings: t("Settings saved."),
+  scenario: t("Scenario saved."), 'remove-scenario': t("Scenario removed."),
+  'test-action': t("Action started. The outcome of each command appears in the log."),
+  'test-scenario': t("Scenario started. The outcome of each command appears in the log."),
 };
 
 let busy = false;
@@ -39,9 +47,9 @@ async function api(action, fields = {}) {
     cache: 'no-store',
   });
   $('#auth-message').hidden = response.status !== 401;
-  if (response.status === 401) throw new Error('Connexion à Matterbridge requise.');
+  if (response.status === 401) throw new Error(t("Sign-in to Matterbridge is required."));
   const result = await response.json();
-  if (result.error || !response.ok) throw new Error(result.error || 'Le plugin est indisponible.');
+  if (result.error || !response.ok) throw new Error(serverText(result.error) || t("The plugin is unavailable."));
   return result;
 }
 
@@ -51,11 +59,12 @@ async function request(action, fields = {}) {
   window.PluginUI?.busy(true);
   revision++;
   configuration.inert = true;
-  message.textContent = action.startsWith('pair') ? 'Jumelage en cours…' : 'Chargement…';
+  message.textContent = action.startsWith('pair') ? t("Pairing…") : t("Loading…");
   try {
     current = await api(action, action === 'status' ? { ...fields, refreshProfiles: true } : fields);
     const kind = action.replace('remove-', '');
     if (forms[kind]) reset(kind);
+    if (action === 'rename-device' || action === 'remove-device') renameForm.hidden = true;
     renderConfiguration(current);
     renderStatus(current);
     message.textContent = success[action] || '';
@@ -75,51 +84,75 @@ function renderStatus({ alarm, peers, actionRunning }) {
   const remaining = state.deadline === null ? 0 : Math.max(0, Math.ceil((state.deadline - Date.now()) / 1000));
   let countdown = '';
   if (['exit', 'entry', 'triggered'].includes(state.phase) && state.deadline !== null) countdown = ` · ${remaining} s`;
-  if (state.phase === 'triggered' && state.deadline === null) countdown = ' · durée illimitée';
+  if (state.phase === 'triggered' && state.deadline === null) countdown = t(" · no time limit");
   $('#alarm-status').textContent = [phases[state.phase], mode?.name].filter(Boolean).join(' · ') + countdown + (state.cause ? ` · ${state.cause}` : '');
-  const offline = mode ? rules.filter(({ zoneIds, abnormal }) => abnormal === null && mode.zones.some((id) => zoneIds.includes(id))).map(({ name }) => name) : [];
-  $('#zone-status').textContent = offline.length ? `Conditions indisponibles · ${offline.join(', ')}` : '';
+  const monitoredRuleIds = new Set(zones.filter(({ id }) => mode?.zones.includes(id)).flatMap(({ ruleIds }) => ruleIds));
+  const offline = rules.filter(({ id, abnormal }) => abnormal === null && monitoredRuleIds.has(id)).map(({ name }) => name);
+  $('#zone-status').textContent = offline.length ? t("Conditions unavailable · {0}", offline.join(', ')) : '';
   for (const rule of rules) {
     const label = document.getElementById(`rule-${rule.id}`);
     if (label) {
-      if (!rule.signalInfo) label.textContent = 'À remplacer';
-      else if (rule.abnormal === null) label.textContent = 'Indisponible';
-      else if (rule.event) label.textContent = 'À l’écoute';
-      else label.textContent = rule.abnormal ? 'Condition remplie' : 'Condition non remplie';
+      if (!rule.signalInfo) label.textContent = t("Needs replacement");
+      else if (rule.abnormal === null) label.textContent = t("Unavailable");
+      else if (rule.event) label.textContent = t("Listening");
+      else label.textContent = rule.abnormal ? t("Condition met") : t("Condition not met");
     }
   }
   for (const zone of zones) {
     const label = document.getElementById(`zone-${zone.id}`);
     if (!label) continue;
-    const conditions = rules.filter(({ zoneIds }) => zoneIds.includes(zone.id));
+    const conditions = rules.filter(({ id }) => zone.ruleIds.includes(id));
     if (['entry', 'triggered'].includes(state.phase) && state.zoneIds.includes(zone.id)) label.textContent = phases[state.phase];
-    else if (conditions.some(({ abnormal }) => abnormal === true)) label.textContent = 'Anormale';
-    else if (conditions.some(({ abnormal }) => abnormal === null)) label.textContent = 'État incomplet';
-    else label.textContent = conditions.length ? 'Normale' : 'Aucun déclencheur';
+    else if (conditions.some(({ abnormal }) => abnormal === true)) label.textContent = t("Abnormal");
+    else if (conditions.some(({ abnormal }) => abnormal === null)) label.textContent = t("Incomplete status");
+    else label.textContent = conditions.length ? t("Normal") : t("No triggers");
   }
   const disarmed = state.phase === 'disarmed';
   const pending = alarm.pendingActions.length;
-  $('#actions-status').textContent = pending ? `${pending} commande(s) d’action en attente.` : actionRunning ? 'Une commande Matter est en cours.' : '';
+  $('#actions-status').textContent = pending ? t("Pending action commands: {0}.", pending) : actionRunning ? t("Running a Matter command.") : '';
   const configurable = disarmed && pending === 0 && !actionRunning;
   $('#disarm').disabled = disarmed;
   $('#disarm').dataset.mode = state.modeId ?? '';
   for (const control of configuration.querySelectorAll('[data-activate]')) {
     control.disabled = control.dataset.activate === state.modeId || ['entry', 'triggered'].includes(state.phase);
   }
-  for (const element of configuration.querySelectorAll('[data-disarmed], #mode-form :is(input,button), #zone-form :is(input,button), #disarm-actions-form :is(input,button), #rule-form :is(input,select,button), #settings :is(input,button), #action-form :is(input,select,button)')) {
+  for (const candidate of modes) {
+    const label = document.getElementById(`mode-${candidate.id}`);
+    const active = candidate.id === mode?.id;
+    if (label) label.textContent = (active && modePhases[state.phase]) || '';
+    const control = document.getElementById(`mode-control-${candidate.id}`);
+    if (!control) continue;
+    const text = active ? t("Disarm") : t("Activate");
+    if (control.textContent !== text) {
+      control.textContent = text;
+      control.setAttribute('aria-label', `${text} ${candidate.name}`);
+    }
+    control.dataset.arm = String(!active);
+    control.disabled = !active && ['entry', 'triggered'].includes(state.phase);
+  }
+  for (const element of configuration.querySelectorAll('[data-disarmed], form:not(#pair-device, #rename-device) :is(input, select, button)')) {
     element.disabled = !configurable;
   }
   for (const peer of peers) {
-    const label = document.getElementById(`peer-${peer.id}`);
-    if (label) label.textContent = `${peer.label} · ${peer.connected ? 'connecté' : 'hors ligne'}`;
+    renderDeviceStatus(peer.id, peer.endpoints.filter((endpoint) => !endpoint.bridged), peer.connected);
+    for (const endpoint of peer.endpoints.filter((part) => part.bridged)) {
+      renderDeviceStatus(`${peer.id}/${endpoint.number}`, [endpoint], endpoint.connected);
+    }
   }
   renderRuleState(peers);
-  const journal = $('#history');
-  const entries = history.map((entry) => listItem(`${new Date(entry.at).toLocaleString('fr-FR')} · ${entry.source} · ${entry.message}`));
-  journal.replaceChildren(...(entries.length ? entries : [listItem('Aucun événement enregistré.')]));
+  renderTable('history', history.map(({ at, source, message }) =>
+    tableRow(new Date(at).toLocaleString(language), serverText(source), logMessage(source, message))), t("No events recorded."));
 }
 
-function renderConfiguration({ alarm, peers, actionRunning, controllers = [] }) {
+function logMessage(source, message) {
+  if (source !== 'Action Matter' || language !== 'en') return serverText(message);
+  const parts = message.split(' · ');
+  parts[0] = serverText(parts[0]);
+  parts[2] = serverText(parts[2]);
+  return parts.map((part, index) => index >= 5 ? serverText(part) : part).join(' · ');
+}
+
+function renderConfiguration({ alarm, peers, controllers = [] }) {
   configuration.hidden = false;
   for (const [id, value] of [['mode-count', alarm.modes.length], ['zone-count', alarm.zones.length], ['rule-count', alarm.rules.length]]) document.getElementById(id).textContent = value;
   for (const [name, value] of Object.entries(alarm.settings)) {
@@ -140,52 +173,48 @@ function renderConfiguration({ alarm, peers, actionRunning, controllers = [] }) 
   }));
 
   const zoneName = (id) => alarm.zones.find((zone) => zone.id === id)?.name;
-  renderItems('zone', alarm.zones, (zone) => {
-    const item = listItem(`${zone.name} · `);
-    const status = document.createElement('span');
-    status.id = `zone-${zone.id}`;
-    item.append(status, document.createTextNode(bindingSummary(zone)));
-    return item;
-  });
+  const ruleName = (id) => alarm.rules.find((rule) => rule.id === id)?.name;
+  const actionName = (id) => alarm.actions.find((action) => action.id === id)?.name;
+  const scenarioName = (id) => alarm.scenarios.find((scenario) => scenario.id === id)?.name;
+  renderItems('zone', alarm.zones,
+    (zone) => tableRow(zone.name, zone.ruleIds.map(ruleName).filter(Boolean).join(', ') || '—', statusLabel('zone', zone.id)),
+    t("No zones yet. Group triggers by room or purpose."));
+  renderItems('scenario', alarm.scenarios,
+    (scenario) => tableRow(scenario.name, orderedList(scenario.actionIds.map(actionName).filter(Boolean))),
+    t("No scenarios yet. Group actions to reuse in your modes."),
+    (scenario) => [button(t("Run"), () => void request('test-scenario', { id: scenario.id }), true)]);
   renderItems('mode', alarm.modes, (mode) => {
-    const alarmDuration = mode.alarmSeconds === 0 ? 'alarme illimitée' : `alarme ${mode.alarmSeconds} s`;
-    const item = listItem(`${mode.name} · ${mode.zones.map(zoneName).join(', ') || 'Aucune zone'} · activation ${mode.activationSeconds} s · préalerte ${mode.triggerSeconds} s · ${alarmDuration}`);
-    const activate = button('Activer', () => void request('arm', { arm: true, modeId: mode.id }));
-    activate.dataset.activate = mode.id;
-    item.append(activate, document.createTextNode(bindingSummary(mode)));
-    return item;
+    const delays = labeledValues([
+      [t("Exit delay"), `${mode.activationSeconds} s`],
+      [t("Entry delay"), `${mode.triggerSeconds} s`],
+      [t("Alarm"), mode.alarmSeconds === 0 ? t("Unlimited") : `${mode.alarmSeconds} s`],
+    ]);
+    const scenarios = labeledValues(Object.entries(scenarioPhases).map(([phase, label]) => [
+      label, (mode.scenarios[phase] ?? []).map(scenarioName).filter(Boolean).join(', ') || '—',
+    ]));
+    const row = tableRow(mode.name, mode.zones.map(zoneName).filter(Boolean).join(', ') || t("No zones"), delays, scenarios);
+    row.firstElementChild.append(statusLabel('mode', mode.id));
+    return row;
+  }, t("No modes yet. Create a mode to select the zones to monitor."), (mode) => {
+    const control = button(t("Activate"), ({ currentTarget }) =>
+      void request('arm', { arm: currentTarget.dataset.arm === 'true', modeId: mode.id }));
+    control.id = `mode-control-${mode.id}`;
+    return [control];
   });
   renderItems('rule', alarm.rules, (rule) => {
     const peer = peers.find(({ id }) => id === rule.peer);
     const device = peer?.endpoints.find(({ number }) => number === rule.endpoint);
-    const deviceName = device?.label || rule.deviceLabel || peer?.label || 'Accessoire indisponible';
-    const item = listItem(`${rule.name} · ${deviceName} · ${rule.zoneIds.map(zoneName).join(', ')} · ${triggerDescription(rule)} · `);
-    const status = document.createElement('span');
-    status.id = `rule-${rule.id}`;
-    item.append(status);
-    return item;
-  });
+    const deviceName = device?.label || rule.deviceLabel || peer?.label || t("Accessory unavailable");
+    return tableRow(rule.name, deviceName, triggerDescription(rule), statusLabel('rule', rule.id));
+  }, t("No triggers yet. Choose a Matter device and a detection condition."));
 
-  renderZoneChoices('mode', alarm.zones);
-  renderZoneChoices('rule', alarm.zones);
-  renderActionChoices('mode', alarm.actions);
-  renderActionChoices('zone', alarm.actions);
-  $('#disarm-actions').replaceChildren(...alarm.actions.map((action) => {
-    const label = document.createElement('label');
-    label.className = 'check';
-    const input = document.createElement('input');
-    Object.assign(input, { type: 'checkbox', name: 'actions', value: action.id, checked: alarm.disarmActions.includes(action.id) });
-    label.append(input, action.name);
-    return label;
-  }));
-  if (!alarm.actions.length) $('#disarm-actions').append('Crée d’abord une action.');
-  renderItems('action', alarm.actions, (action) => {
-    const item = listItem(`${action.name} · ${action.operations.map(operationLabel).join(' → ')}`);
-    const test = button('Exécuter', () => request('test-action', { id: action.id }), true);
-    test.disabled = alarm.state.phase !== 'disarmed' || actionRunning;
-    item.append(test);
-    return item;
-  });
+  renderChoices($('#mode-zones'), 'zones', alarm.zones, t("Create a zone first."));
+  renderChoices($('#zone-rules'), 'ruleIds', alarm.rules, t("Create a trigger first."));
+  renderScenarioChoices(alarm.scenarios);
+  renderScenarioSteps(readScenarioSteps());
+  renderItems('action', alarm.actions, (action) => tableRow(action.name, orderedList(action.operations.map(operationLabel))),
+    t("No actions yet. Add lighting commands or a sound profile."),
+    (action) => [button(t("Run"), () => void request('test-action', { id: action.id }), true)]);
   const draftOperations = readActionSteps();
 
   const selectedDevice = ruleFields.device.value;
@@ -218,57 +247,124 @@ function renderConfiguration({ alarm, peers, actionRunning, controllers = [] }) 
   }
   renderActionSteps(draftOperations);
   const triggerDevices = Array.from(endpoints).filter(([, endpoint]) => endpoint.signals.length);
-  ruleFields.device.replaceChildren(new Option('Choisir un accessoire', ''), ...triggerDevices.map(([id, endpoint]) => new Option(endpoint.label, id)));
+  ruleFields.device.replaceChildren(new Option(t("Select an accessory"), ''), ...triggerDevices.map(([id, endpoint]) => new Option(endpoint.label, id)));
   ruleFields.device.value = triggerDevices.some(([id]) => id === selectedDevice) ? selectedDevice : '';
   populateSignals(selectedSignal, selectedTrigger);
 
-  $('#peers').replaceChildren(...peers.map((peer) => {
-    const item = listItem('');
-    const label = document.createElement('span');
-    label.id = `peer-${peer.id}`;
-    item.append(label, button('Retirer', () => {
-      if (confirm(`Retirer « ${peer.label} » du contrôleur Matterbridge ?`)) void request('remove-device', { peer: peer.id });
+  renderTable('peers', peers.flatMap((peer) => [
+    deviceRow(peer), ...peer.endpoints.filter((endpoint) => endpoint.bridged).map((endpoint) => deviceRow(peer, endpoint)),
+  ]), t("No paired devices. Use a Matter sharing code to pair one."));
+}
+
+function deviceRow(peer, endpoint) {
+  const device = endpoint ?? peer;
+  const label = endpoint ? endpoint.customName || endpoint.originalLabel : peer.label;
+  const id = endpoint ? `${peer.id}/${endpoint.number}` : peer.id;
+  const identifiers = labeledValues([
+    [t("Serial number"), device.serialNumber || '—'],
+    [t("Matter ID"), id],
+  ]);
+  const row = tableRow(label, identifiers, statusLabel('contact', id), statusLabel('peer', id));
+  if (endpoint) row.classList.add('bridged-accessory');
+  if (device.customName && device.originalLabel !== device.customName) {
+    const model = document.createElement('small');
+    model.className = 'device-original-name';
+    model.textContent = device.originalLabel;
+    row.firstElementChild.append(model);
+  }
+  const commands = [button(t("Rename"), () => {
+    renameForm.dataset.peer = peer.id;
+    renameForm.dataset.endpoint = endpoint ? String(endpoint.number) : '';
+    renameForm.elements.name.value = device.customName || '';
+    renameForm.elements.name.placeholder = device.originalLabel ?? label;
+    renameForm.hidden = false;
+    renameForm.elements.name.focus();
+  })];
+  if (!endpoint) {
+    commands.push(button(t("Remove"), () => {
+      if (confirm(t("Remove “{0}” from the Matterbridge controller?", peer.label))) void request('remove-device', { peer: peer.id });
     }));
-    return item;
-  }));
-  for (const [id, text] of [['modes', 'Aucun mode. Créer un mode pour choisir les zones à surveiller.'], ['zones', 'Aucune zone. Regrouper les déclencheurs par pièce ou par usage.'], ['rules', 'Aucun déclencheur. Associer un appareil Matter à une ou plusieurs zones.'], ['actions', 'Aucune action. Ajouter des commandes d’éclairage ou un profil sonore.'], ['peers', 'Aucun appareil associé. Utiliser un code de partage Matter pour en ajouter un.']]) window.PluginUI?.empty(id, text);
+  }
+  row.append(commandCell(label, ...commands));
+  return row;
 }
 
-function bindingSummary(item) {
-  const summary = Object.entries(actionEvents).flatMap(([event, label]) => {
-    const names = (item.actions?.[event] ?? []).map((id) => current.alarm.actions.find((action) => action.id === id)?.name).filter(Boolean);
-    return names.length ? [label + ' · ' + names.join(', ')] : [];
-  });
-  return summary.length ? ' · ' + summary.join(' / ') : '';
+function renderDeviceStatus(id, endpoints, connected) {
+  const status = document.getElementById(`peer-${id}`);
+  if (status) status.textContent = connected ? t("Connected") : t("Offline");
+  const contact = document.getElementById(`contact-${id}`);
+  if (contact) contact.textContent = contactStatus(endpoints, connected);
 }
 
-function renderActionChoices(kind, actions) {
-  const container = $(`#${kind}-actions`);
-  const selected = new Set([...container.querySelectorAll('input:checked')].map((input) => input.name + ':' + input.value));
-  container.replaceChildren(...Object.entries(actionEvents).map(([event, title]) => {
+function contactStatus(endpoints, connected) {
+  const contacts = endpoints.flatMap((endpoint) => endpoint.signals.filter((signal) => signal.id === 'contact')
+    .map((signal) => ({ label: endpoint.label, value: signal.value })));
+  return contacts.map(({ label, value }) => {
+    const state = !connected || typeof value !== 'boolean' ? t("Unavailable") : value ? t("Open") : t("Closed");
+    return contacts.length > 1 ? `${label} · ${state}` : state;
+  }).join(' / ') || '—';
+}
+
+function statusLabel(kind, id) {
+  const label = document.createElement('span');
+  label.id = `${kind}-${id}`;
+  label.className = 'table-status';
+  return label;
+}
+
+function renderScenarioChoices(scenarios) {
+  const container = $('#mode-scenarios');
+  if (!scenarios.length) {
+    container.replaceChildren(t("Create a scenario first."));
+    return;
+  }
+  const previous = [...container.querySelectorAll('input:checked')];
+  container.replaceChildren(...Object.entries(scenarioPhases).map(([event, title]) => {
     const group = document.createElement('fieldset');
     const legend = document.createElement('legend');
     legend.textContent = title;
     group.append(legend);
-    for (const action of actions) {
-      const label = document.createElement('label');
-      label.className = 'check';
-      const input = document.createElement('input');
-      Object.assign(input, { type: 'checkbox', name: 'actions-' + event, value: action.id });
-      input.dataset.actionEvent = event;
-      input.checked = selected.has(input.name + ':' + input.value);
-      label.append(input, action.name);
-      group.append(label);
-    }
-    if (!actions.length) group.append('Crée d’abord une action.');
+    const choices = document.createElement('div');
+    group.append(choices);
+    const name = 'scenarios-' + event;
+    renderChoices(choices, name, scenarios, '', previous.filter((input) => input.name === name).map((input) => input.value));
     return group;
   }));
+}
+
+function readScenarioSteps() {
+  return [...$('#scenario-steps').querySelectorAll('select')].map(({ value }) => value);
+}
+
+function renderScenarioSteps(actionIds) {
+  $('#scenario-steps').replaceChildren();
+  const hasActions = current.alarm.actions.length > 0;
+  $('#scenario-empty').hidden = hasActions;
+  $('#add-scenario-step').hidden = !hasActions;
+  if (hasActions) for (const id of actionIds.length ? actionIds : ['']) addScenarioStep(id);
+}
+
+function addScenarioStep(id = '') {
+  const row = document.createElement('li');
+  row.className = 'action-step';
+  const label = document.createElement('label');
+  const select = document.createElement('select');
+  select.required = true;
+  select.add(new Option(t("Select an action"), ''));
+  for (const action of current.alarm.actions) select.add(new Option(action.name, action.id));
+  select.value = current.alarm.actions.some((action) => action.id === id) ? id : '';
+  label.append('Action', select);
+  row.append(label,
+    button(t("Move up"), () => row.previousElementSibling?.before(row), true),
+    button(t("Move down"), () => row.nextElementSibling?.after(row), true),
+    button(t("Remove"), () => row.remove(), true));
+  $('#scenario-steps').append(row);
 }
 
 function operationLabel(operation) {
   const target = current?.peers.find((p) => p.id === operation.peer)?.endpoints.find((e) => e.number === operation.endpoint);
   const choice = target?.commands.find((c) => c.id === operation.command)?.choices?.find((c) => c.value === operation.value);
-  const value = operation.value === undefined ? '' : ' ' + (operation.command === 'profile' ? choice?.label ?? operation.valueLabel ?? 'Profil indisponible' : operation.value);
+  const value = operation.value === undefined ? '' : ' ' + (operation.command === 'profile' ? profileName(operation.value, choice?.label ?? operation.valueLabel) ?? t("Profile unavailable") : operation.value);
   return `${target?.label || operation.label || operation.peer} · ${commandNames[operation.command]}${value}`;
 }
 
@@ -292,18 +388,18 @@ function addActionStep(operation = {}) {
   const row = document.createElement('li');
   row.className = 'action-step';
   const targetLabel = document.createElement('label');
-  targetLabel.append('Accessoire');
+  targetLabel.append(t("Accessory"));
   const target = document.createElement('select');
   target.dataset.target = '';
   target.required = true;
-  target.add(new Option('Choisir un accessoire', ''));
+  target.add(new Option(t("Select an accessory"), ''));
   for (const [id, endpoint] of endpoints) {
     if (endpoint.commands.length) target.add(new Option(`${endpoint.label} · endpoint ${endpoint.number}`, id));
   }
   target.value = operation.peer ? deviceKey(operation.peer, operation.endpoint) : '';
   targetLabel.append(target);
   const commandLabel = document.createElement('label');
-  commandLabel.append('Commande');
+  commandLabel.append(t("Command"));
   const command = document.createElement('select');
   command.dataset.command = '';
   command.required = true;
@@ -317,11 +413,11 @@ function addActionStep(operation = {}) {
       const select = document.createElement('select');
       select.dataset.value = '';
       select.required = true;
-      select.add(new Option('Choisir un profil', ''));
-      for (const choice of capability.choices ?? []) select.add(new Option(choice.label, choice.value));
-      if (value && ![...select.options].some((option) => option.value === value)) select.add(new Option(operation.valueLabel ? `${operation.valueLabel} · indisponible` : 'Profil indisponible', value));
+      select.add(new Option(t("Select a profile"), ''));
+      for (const choice of capability.choices ?? []) select.add(new Option(profileName(choice.value, choice.label), choice.value));
+      if (value && ![...select.options].some((option) => option.value === value)) select.add(new Option(operation.valueLabel ? t("{0} · unavailable", operation.valueLabel) : t("Profile unavailable"), value));
       select.value = value ?? '';
-      valueLabel.append('Profil sonore', select);
+      valueLabel.append(t("Sound profile"), select);
       return;
     }
     const input = document.createElement('input');
@@ -329,54 +425,54 @@ function addActionStep(operation = {}) {
     input.required = true;
     input.type = command.value === 'color' ? 'color' : 'number';
     if (command.value !== 'color') {
-      input.min = capability.min ?? (['brightness', 'volume'].includes(command.value) ? 0 : 1000);
-      input.max = capability.max ?? (['brightness', 'volume'].includes(command.value) ? 100 : 20000);
+      input.min = capability.min ?? (percentCommands.has(command.value) ? 0 : 1000);
+      input.max = capability.max ?? (percentCommands.has(command.value) ? 100 : 20000);
       input.step = '1';
     }
-    input.value = value ?? (command.value === 'color' ? '#ff0000' : command.value === 'brightness' ? 100 : command.value === 'volume' ? 25 : capability.min ?? 2700);
+    const initialValues = { color: '#ff0000', brightness: 100, volume: 25, 'master-volume': 100 };
+    input.value = value ?? initialValues[command.value] ?? capability.min ?? 2700;
     valueLabel.append(commandNames[command.value], input);
   };
   const populateCommands = (selected, value) => {
     const commands = endpoints.get(target.value)?.commands ?? [];
-    command.replaceChildren(new Option('Choisir une commande', ''), ...commands.map((entry) => new Option(entry.label + (entry.unavailable ? ' · indisponible' : ''), entry.id)));
+    command.replaceChildren(new Option(t("Select a command"), ''), ...commands.map((entry) => new Option(serverText(entry.label) + (entry.unavailable ? t(" · unavailable") : ''), entry.id)));
     command.value = commands.some(({ id }) => id === selected) ? selected : '';
     populateValue(value);
   };
   target.addEventListener('change', () => populateCommands());
   command.addEventListener('change', () => populateValue());
   row.append(targetLabel, commandLabel, valueLabel);
-  row.append(button('Monter', () => row.previousElementSibling?.before(row), true));
-  row.append(button('Descendre', () => row.nextElementSibling?.after(row), true));
-  row.append(button('Retirer', () => row.remove(), true));
+  row.append(button(t("Move up"), () => row.previousElementSibling?.before(row), true));
+  row.append(button(t("Move down"), () => row.nextElementSibling?.after(row), true));
+  row.append(button(t("Remove"), () => row.remove(), true));
   $('#action-steps').append(row);
   populateCommands(operation.command, operation.value);
 }
 
-function renderZoneChoices(kind, zones) {
-  const list = $(`#${kind}-zones`);
-  const checked = new Set([...list.querySelectorAll('input:checked')].map(({ value }) => value));
-  list.replaceChildren(...zones.map((zone) => {
+function renderChoices(list, name, items, empty, selected) {
+  const checked = new Set(selected ?? [...list.querySelectorAll('input:checked')].map(({ value }) => value));
+  list.replaceChildren(...items.map((item) => {
     const label = document.createElement('label');
     label.className = 'check';
     const input = document.createElement('input');
     input.type = 'checkbox';
-    input.name = 'zones';
-    input.value = zone.id;
-    input.checked = checked.has(zone.id);
-    label.append(input, zone.name);
+    input.name = name;
+    input.value = item.id;
+    input.checked = checked.has(item.id);
+    label.append(input, item.name);
     return label;
   }));
+  if (!items.length) list.append(empty);
 }
 
-function renderItems(kind, items, makeItem) {
-  const list = $(`#${kind}s`);
-  list.replaceChildren(...items.map((entry) => {
-    const item = makeItem(entry);
-    item.append(button('Modifier', () => edit(kind, entry), true), button('Retirer', () => {
-      if (confirm(`Retirer « ${entry.name} » ?`)) void request(`remove-${kind}`, { id: entry.id });
-    }, true));
-    return item;
-  }));
+function renderItems(kind, items, makeRow, empty, extraCommands = () => []) {
+  renderTable(`${kind}s`, items.map((entry) => {
+    const row = makeRow(entry);
+    row.append(commandCell(entry.name, ...extraCommands(entry), button(t("Edit"), () => edit(kind, entry), true), button(t("Remove"), () => {
+      if (confirm(t("Remove “{0}”?", entry.name))) void request(`remove-${kind}`, { id: entry.id });
+    }, true)));
+    return row;
+  }), empty);
 }
 
 function edit(kind, item) {
@@ -386,12 +482,15 @@ function edit(kind, item) {
   editing[kind] = item.id;
   fields.namedItem('name').value = item.name;
   if (kind === 'action') renderActionSteps(item.operations);
-  if (kind === 'zone' || kind === 'mode') {
-    for (const input of form.querySelectorAll('[data-action-event]')) {
-      input.checked = item.actions?.[input.dataset.actionEvent]?.includes(input.value) ?? false;
-    }
-  }
+  if (kind === 'scenario') renderScenarioSteps(item.actionIds);
+  if (kind === 'zone') renderChoices($('#zone-rules'), 'ruleIds', current.alarm.rules, t("Create a trigger first."), item.ruleIds);
   if (kind === 'mode') {
+    for (const input of form.querySelectorAll('[name=zones]')) input.checked = item.zones.includes(input.value);
+    for (const phase of Object.keys(scenarioPhases)) {
+      for (const input of form.querySelectorAll(`[name="scenarios-${phase}"]`)) {
+        input.checked = (item.scenarios[phase] ?? []).includes(input.value);
+      }
+    }
     fields.activationSeconds.value = item.activationSeconds;
     fields.triggerSeconds.value = item.triggerSeconds;
     fields.alarmSeconds.value = item.alarmSeconds;
@@ -399,11 +498,9 @@ function edit(kind, item) {
     fields.device.value = deviceKey(item.peer, item.endpoint);
     populateSignals(item.signal, item.trigger);
   }
-  const zoneIds = item.zoneIds ?? item.zones ?? [];
-  for (const input of form.querySelectorAll('[name=zones]')) input.checked = zoneIds.includes(input.value);
-  form.querySelector('.save').textContent = `Enregistrer ${labels[kind]}`;
+  form.querySelector('.save').textContent = t("Save {0}", labels[kind]);
   form.querySelector('.cancel').hidden = false;
-  window.PluginUI?.show(({ mode: 'modes', zone: 'zones', rule: 'rules', action: 'actions' })[kind]);
+  window.PluginUI?.show(kind + 's');
   fields.namedItem('name').focus();
 }
 
@@ -413,7 +510,8 @@ function reset(kind) {
   form.reset();
   if (kind === 'rule') populateSignals();
   if (kind === 'action') renderActionSteps([]);
-  form.querySelector('.save').textContent = `Ajouter ${labels[kind]}`;
+  if (kind === 'scenario') renderScenarioSteps([]);
+  form.querySelector('.save').textContent = t("Add {0}", labels[kind]);
   form.querySelector('.cancel').hidden = true;
 }
 
@@ -421,12 +519,12 @@ const deviceKey = (peer, endpoint) => JSON.stringify([peer, endpoint]);
 function triggerDescription(rule) {
   const peer = current?.peers.find(({ id }) => id === rule.peer);
   const signal = peer?.endpoints.find(({ number }) => number === rule.endpoint)?.signals.find(({ id }) => id === rule.signal);
-  return (signal ?? rule.signalInfo)?.triggers.find(({ id }) => id === rule.trigger)?.label || 'Déclencheur à remplacer';
+  return serverText((signal ?? rule.signalInfo)?.triggers.find(({ id }) => id === rule.trigger)?.label) || t("Trigger needs replacement");
 }
 
 function populateSignals(selected, trigger) {
   const signals = endpoints.get(ruleFields.device.value)?.signals ?? [];
-  ruleFields.signal.replaceChildren(new Option('Choisir une détection', ''), ...signals.map((signal) => new Option(signal.label + (signal.unavailable ? ' · indisponible' : ''), signal.id)));
+  ruleFields.signal.replaceChildren(new Option(t("Select a detection type"), ''), ...signals.map((signal) => new Option(serverText(signal.label) + (signal.unavailable ? t(" · unavailable") : ''), signal.id)));
   if (signals.some(({ id }) => id === selected)) ruleFields.signal.value = selected;
   else ruleFields.signal.value = signals.length === 1 ? signals[0].id : '';
   populateTriggers(trigger);
@@ -435,7 +533,7 @@ function populateSignals(selected, trigger) {
 function populateTriggers(selected) {
   const signal = endpoints.get(ruleFields.device.value)?.signals.find(({ id }) => id === ruleFields.signal.value);
   const choices = signal?.triggers ?? [];
-  ruleFields.trigger.replaceChildren(...choices.map(({ id, label }) => new Option(label, id)));
+  ruleFields.trigger.replaceChildren(...choices.map(({ id, label }) => new Option(serverText(label), id)));
   if (choices.some(({ id }) => id === selected)) ruleFields.trigger.value = selected;
   renderRuleState();
 }
@@ -450,14 +548,63 @@ function renderRuleState(peers = current?.peers ?? []) {
   const [peerId, number] = JSON.parse(target);
   const peer = peers.find(({ id }) => id === peerId);
   const signal = peer?.endpoints.find((endpoint) => endpoint.number === number)?.signals.find(({ id }) => id === ruleFields.signal.value);
-  if (!peer?.connected || typeof signal?.value !== 'boolean') output.textContent = 'État actuel indisponible.';
-  else output.textContent = 'État actuel · ' + (signal.value ? signal.activeLabel : signal.inactiveLabel);
+  if (!peer?.connected || typeof signal?.value !== 'boolean') output.textContent = t("Current state unavailable.");
+  else output.textContent = t("Current state · ") + serverText(signal.value ? signal.activeLabel : signal.inactiveLabel);
 }
 
 function listItem(text) {
   const item = document.createElement('li');
   item.textContent = text;
   return item;
+}
+
+function orderedList(entries) {
+  if (!entries.length) return '—';
+  const list = document.createElement('ol');
+  list.append(...entries.map(listItem));
+  return list;
+}
+
+function labeledValues(entries) {
+  const list = document.createElement('dl');
+  for (const [label, value] of entries) {
+    const term = document.createElement('dt');
+    const description = document.createElement('dd');
+    term.textContent = label;
+    description.textContent = value;
+    list.append(term, description);
+  }
+  return list;
+}
+
+function tableRow(title, ...values) {
+  const row = document.createElement('tr');
+  const header = document.createElement('th');
+  header.scope = 'row';
+  header.textContent = title;
+  row.append(header);
+  for (const value of values) row.insertCell().append(value);
+  return row;
+}
+
+function commandCell(name, ...buttons) {
+  const cell = document.createElement('td');
+  const controls = document.createElement('div');
+  controls.className = 'table-commands';
+  for (const control of buttons) control.setAttribute('aria-label', `${control.textContent} ${name}`);
+  controls.append(...buttons);
+  cell.append(controls);
+  return cell;
+}
+
+function renderTable(id, rows, empty) {
+  const body = document.getElementById(id);
+  body.replaceChildren(...rows);
+  if (rows.length) return;
+  const cell = body.insertRow().insertCell();
+  cell.colSpan = body.closest('table').tHead.rows[0].cells.length;
+  cell.className = 'table-empty';
+  cell.textContent = empty;
 }
 
 function button(text, handler, disarmed = false) {
@@ -472,10 +619,7 @@ function button(text, handler, disarmed = false) {
 $('#refresh').addEventListener('click', () => void request('status'));
 $('#disarm').addEventListener('click', (event) => void request('arm', { arm: false, modeId: event.currentTarget.dataset.mode }));
 $('#add-action-step').addEventListener('click', () => addActionStep());
-$('#disarm-actions-form').addEventListener('submit', (event) => {
-  event.preventDefault();
-  void request('disarm-actions', { actions: new FormData(event.currentTarget).getAll('actions') });
-});
+$('#add-scenario-step').addEventListener('click', () => addScenarioStep());
 ruleFields.device.addEventListener('change', () => populateSignals());
 ruleFields.signal.addEventListener('change', () => populateTriggers());
 for (const [kind, form] of Object.entries(forms)) {
@@ -485,18 +629,18 @@ for (const [kind, form] of Object.entries(forms)) {
     const values = new FormData(form);
     const item = { id: editing[kind], name: values.get('name') };
     if (kind === 'action') item.operations = readActionSteps();
-    if (kind === 'mode' || kind === 'zone') {
-      item.actions = Object.fromEntries(Object.keys(actionEvents).map((event) => [event, values.getAll('actions-' + event)]));
-    }
+    if (kind === 'zone') item.ruleIds = values.getAll('ruleIds');
+    if (kind === 'scenario') item.actionIds = readScenarioSteps();
     if (kind === 'mode') Object.assign(item, {
       zones: values.getAll('zones'),
+      scenarios: Object.fromEntries(Object.keys(scenarioPhases).map((phase) => [phase, values.getAll('scenarios-' + phase)])),
       activationSeconds: Number(values.get('activationSeconds')),
       triggerSeconds: Number(values.get('triggerSeconds')),
       alarmSeconds: Number(values.get('alarmSeconds')),
     });
     if (kind === 'rule') {
       const [peer, endpoint] = JSON.parse(values.get('device'));
-      Object.assign(item, { zoneIds: values.getAll('zones'), peer, endpoint, signal: values.get('signal'), trigger: values.get('trigger') });
+      Object.assign(item, { peer, endpoint, signal: values.get('signal'), trigger: values.get('trigger') });
     }
     void request(kind, item);
   });
@@ -508,7 +652,9 @@ settingsForm.addEventListener('submit', (event) => {
   void request('settings', {
     detector: values.has('detector'),
     homeDisarm: values.has('homeDisarm'),
-    trustedControllers: values.getAll('trustedControllers'),
+    exposeSwitches: values.has('exposeSwitches'),
+    exposeLocks: values.has('exposeLocks'),
+    ...(current.controllers?.length ? { trustedControllers: values.getAll('trustedControllers') } : {}),
   });
 });
 
@@ -520,6 +666,15 @@ $('#pair-device').addEventListener('submit', (event) => {
   void request('pair-device', { code });
 });
 
+renameForm.addEventListener('submit', (event) => {
+  event.preventDefault();
+  const { peer, endpoint } = renameForm.dataset;
+  void request('rename-device', {
+    peer, ...(endpoint ? { endpoint: Number(endpoint) } : {}), name: renameForm.elements.name.value,
+  });
+});
+renameForm.querySelector('.cancel').addEventListener('click', () => { renameForm.hidden = true; });
+
 let polling = false;
 setInterval(async () => {
   if (configuration.hidden || document.hidden || busy || polling) return;
@@ -529,7 +684,7 @@ setInterval(async () => {
     const latest = await api('status');
     if (!busy && requestedRevision === revision) renderStatus(latest);
   } catch {
-    if (!busy && requestedRevision === revision) $('#alarm-status').textContent = 'État indisponible · actualise la page.';
+    if (!busy && requestedRevision === revision) $('#alarm-status').textContent = t("Status unavailable. Refresh the page.");
   } finally {
     polling = false;
   }

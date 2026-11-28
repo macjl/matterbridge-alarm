@@ -1,10 +1,10 @@
 import { readFile, rename, writeFile } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
-import { isEventRule, isSupportedRule, matchesEvent, normalizeRule, signalInfo } from './attributes.js';
+import { isEventRule, isSupportedRule, matchesEvent, signalInfo } from './attributes.js';
 
 const idle = { phase: 'disarmed', modeId: null, deadline: null, cause: null, zoneIds: [], actionKeys: [] };
-const defaults = { homeDisarm: false, detector: false, trustedControllers: [] };
-const actionEventNames = { exit: 'Pré-armement', armed: 'Armé', entry: 'Pré-alarme', triggered: 'Alarme', disarmed: 'Désarmer', test: 'Essai manuel' };
+const defaults = { homeDisarm: false, detector: false, exposeSwitches: true, exposeLocks: false, trustedControllers: [] };
+const actionEventNames = { exit: 'Pré-armement', armed: 'Armé', entry: 'Pré-alarme', triggered: 'Alarme', disarmed: 'Désarmement', test: 'Essai manuel' };
 
 export class Alarm {
   constructor({ storagePath, changed, onError }) {
@@ -16,17 +16,13 @@ export class Alarm {
   }
 
   async start() {
-    this.record = { version: 2, settings: defaults, zones: [], rules: [], modes: [], actions: [], disarmActions: [], pendingActions: [], state: idle, history: [] };
+    this.record = { version: 4, settings: defaults, deviceNames: {}, endpointNames: {}, zones: [], rules: [], modes: [], actions: [], scenarios: [], pendingActions: [], state: idle, history: [] };
     try {
       const saved = JSON.parse(await readFile(this.storagePath, 'utf8'));
-      if (saved.version === 2) {
-        this.record = { ...this.record, ...saved, settings: { ...defaults, ...saved.settings }, state: { ...idle, ...saved.state }, rules: saved.rules.map(normalizeRule) };
-        for (const item of [...this.record.zones, ...this.record.modes]) delete item.actions?.disarmed;
-        this.record.modes = this.record.modes.map((mode) => ({
-          ...mode, alarmSeconds: mode.alarmSeconds ?? 120,
-        }));
-
-      }
+      if (saved.version !== this.record.version) throw new Error('Format de configuration incompatible. Sauvegarde le fichier avant de l’adapter au format actuel.');
+      this.record = {
+        ...this.record, ...saved, settings: { ...defaults, ...saved.settings }, state: { ...idle, ...saved.state },
+      };
     } catch (error) {
       if (error.code !== 'ENOENT') throw error;
     }
@@ -67,7 +63,10 @@ export class Alarm {
       if (['entry', 'triggered'].includes(state.phase)) return 'Désarme l’alarme avant de changer de mode pendant une alerte.';
       const mode = modes.find(({ id }) => id === modeId);
       if (!mode) return 'Ce mode n’existe plus.';
-      if (!rules.some((rule) => isSupportedRule(rule) && mode.zones.some((id) => rule.zoneIds.includes(id)))) return 'Ajoute au moins un déclencheur dans les zones de ce mode.';
+      const zones = this.monitoredZones(mode);
+      if (!rules.some((rule) => isSupportedRule(rule) && zones.some(({ ruleIds }) => ruleIds.includes(rule.id)))) {
+        return 'Ajoute au moins un déclencheur dans les zones de ce mode.';
+      }
       if (mode.activationSeconds > 0) {
         await this.transition({ ...idle, phase: 'exit', modeId, deadline: Date.now() + mode.activationSeconds * 1000 }, source, `Activation · ${mode.name}.`);
       } else {
@@ -86,13 +85,51 @@ export class Alarm {
   }
 
   saveSettings(input) {
-    const { homeDisarm, detector, trustedControllers = this.record.settings.trustedControllers ?? [] } = input;
-    if ([homeDisarm, detector].some((value) => typeof value !== 'boolean')
+    const { settings } = this.record;
+    const { homeDisarm, detector, exposeSwitches = settings.exposeSwitches, exposeLocks = settings.exposeLocks,
+      trustedControllers = settings.trustedControllers } = input;
+    if ([homeDisarm, detector, exposeSwitches, exposeLocks].some((value) => typeof value !== 'boolean')
       || !Array.isArray(trustedControllers) || trustedControllers.length > 64
       || !trustedControllers.every((id) => typeof id === 'string' && /^[0-9a-f]{64}$/.test(id))) {
       return 'Vérifie les autorisations et les réglages de l’alarme.';
     }
-    return this.configure((record) => ({ ...record, settings: { ...record.settings, homeDisarm, detector, trustedControllers: [...new Set(trustedControllers)] } }));
+    return this.configure((record) => ({
+      ...record, settings: { ...record.settings, homeDisarm, detector, exposeSwitches, exposeLocks, trustedControllers: [...new Set(trustedControllers)] },
+    }));
+  }
+
+  setDeviceName(id, name) {
+    return this.run(async () => {
+      const deviceNames = { ...this.record.deviceNames };
+      if ((deviceNames[id] ?? '') === name) return;
+      if (name) deviceNames[id] = name;
+      else delete deviceNames[id];
+      await this.commit({ ...this.record, deviceNames });
+    });
+  }
+
+  setEndpointName(peerId, endpointId, name) {
+    return this.run(async () => {
+      const endpointNames = { ...this.record.endpointNames };
+      const names = { ...endpointNames[peerId] };
+      if ((names[endpointId] ?? '') === name) return;
+      if (name) names[endpointId] = name;
+      else delete names[endpointId];
+      if (Object.keys(names).length) endpointNames[peerId] = names;
+      else delete endpointNames[peerId];
+      await this.commit({ ...this.record, endpointNames });
+    });
+  }
+
+  forgetDeviceNames(id) {
+    return this.run(async () => {
+      if (!Object.hasOwn(this.record.deviceNames, id) && !Object.hasOwn(this.record.endpointNames, id)) return;
+      const deviceNames = { ...this.record.deviceNames };
+      const endpointNames = { ...this.record.endpointNames };
+      delete deviceNames[id];
+      delete endpointNames[id];
+      await this.commit({ ...this.record, deviceNames, endpointNames });
+    });
   }
 
   configure(change) {
@@ -110,8 +147,12 @@ export class Alarm {
       const items = record[collection];
       if (item.editing && !items.some(({ id }) => id === item.id)) return 'Cet élément n’existe plus.';
       const { editing, ...data } = item;
-      if (collection === 'modes' && items.some(({ id, name }) => id !== data.id && name.toLowerCase() === data.name.toLowerCase())) {
-        return 'Ce nom de mode est déjà utilisé.';
+      if (collection === 'zones' && !hasSelection(record.rules, data.ruleIds)) return 'Vérifie les déclencheurs de la zone.';
+      if (collection === 'scenarios' && !hasSelection(record.actions, data.actionIds)) return 'Vérifie les actions du scénario.';
+      if (collection === 'modes') {
+        if (!hasSelection(record.zones, data.zones)) return 'Vérifie les zones surveillées par ce mode.';
+        if (!Object.values(data.scenarios).every((ids) => hasSelection(record.scenarios, ids))) return 'Vérifie les scénarios de ce mode.';
+        if (items.some(({ id, name }) => id !== data.id && name.toLowerCase() === data.name.toLowerCase())) return 'Ce nom de mode est déjà utilisé.';
       }
       return { ...record, [collection]: editing ? items.map((entry) => entry.id === data.id ? data : entry) : [...items, data] };
     });
@@ -119,12 +160,17 @@ export class Alarm {
 
   removeItem(collection, id) {
     return this.configure((record) => {
-      if (collection === 'zones' && (record.rules.some(({ zoneIds }) => zoneIds.includes(id)) || record.modes.some(({ zones }) => zones.includes(id)))) {
-        return 'Retire d’abord les conditions de cette zone et dissocie-la des modes.';
+      if (collection === 'zones' && record.modes.some(({ zones }) => zones.includes(id))) {
+        return 'Dissocie d’abord cette zone des modes qui la surveillent.';
       }
-      if (collection === 'actions' && (record.disarmActions.includes(id)
-        || [...record.zones, ...record.modes].some((item) => Object.values(item.actions ?? {}).some((ids) => ids.includes(id))))) {
-        return 'Dissocie d’abord cette action des zones, des modes et de Désarmer.';
+      if (collection === 'rules' && record.zones.some(({ ruleIds }) => ruleIds.includes(id))) {
+        return 'Retire d’abord ce déclencheur des zones qui l’utilisent.';
+      }
+      if (collection === 'actions' && record.scenarios.some(({ actionIds }) => actionIds.includes(id))) {
+        return 'Retire d’abord cette action des scénarios qui l’utilisent.';
+      }
+      if (collection === 'scenarios' && record.modes.some(({ scenarios }) => Object.values(scenarios).some((ids) => ids.includes(id)))) {
+        return 'Dissocie d’abord ce scénario des modes qui l’utilisent.';
       }
       return { ...record, [collection]: record[collection].filter((item) => item.id !== id) };
     });
@@ -151,20 +197,33 @@ export class Alarm {
         const zoneIds = this.abnormalZones(mode, events);
         const added = this.record.zones.filter(({ id }) => zoneIds.includes(id) && !this.record.state.zoneIds.includes(id));
         if (added.length) {
-          await this.transition({ ...this.record.state, zoneIds: [...new Set([...this.record.state.zoneIds, ...zoneIds])] }, 'Objet Matter', `Intrusion · ${added.map(({ name }) => name).join(', ')}.`);
+          const names = added.map(({ name }) => name).join(', ');
+          const detected = this.record.rules.filter((candidate) => this.ruleIsAbnormal(candidate, events)
+            && added.some(({ ruleIds }) => ruleIds.includes(candidate.id))).map(({ name }) => name);
+          await this.transition({ ...this.record.state, zoneIds: [...new Set([...this.record.state.zoneIds, ...zoneIds])] },
+            'Objet Matter', `Intrusion · ${names} · ${detected.join(', ')}.`);
         }
       }
     });
   }
 
+  monitoredZones(mode) {
+    return this.record.zones.filter(({ id }) => mode.zones.includes(id));
+  }
+
+  ruleIsAbnormal(rule, events) {
+    return events.has(rule.id) || this.evaluate(rule).abnormal === true;
+  }
+
   findAbnormal(mode, events = new Set()) {
-    return this.record.rules.find((rule) => mode.zones.some((id) => rule.zoneIds.includes(id))
-      && (events.has(rule.id) || this.evaluate(rule).abnormal === true));
+    const zones = this.monitoredZones(mode);
+    return this.record.rules.find((rule) => zones.some(({ ruleIds }) => ruleIds.includes(rule.id))
+      && this.ruleIsAbnormal(rule, events));
   }
 
   abnormalZones(mode, events = new Set()) {
-    return mode.zones.filter((id) => this.record.rules.some((rule) => rule.zoneIds.includes(id)
-      && (events.has(rule.id) || this.evaluate(rule).abnormal === true)));
+    const abnormal = this.record.rules.filter((rule) => this.ruleIsAbnormal(rule, events));
+    return this.monitoredZones(mode).filter(({ ruleIds }) => abnormal.some(({ id }) => ruleIds.includes(id))).map(({ id }) => id);
   }
 
   async monitor(mode, source, newCycle = false) {
@@ -174,7 +233,7 @@ export class Alarm {
   }
 
   alert(mode, rule, events) {
-    const zones = this.record.zones.filter(({ id }) => mode.zones.includes(id) && rule.zoneIds.includes(id));
+    const zones = this.monitoredZones(mode).filter(({ ruleIds }) => ruleIds.includes(rule.id));
     const cause = `${zones.map(({ name }) => name).join(', ')} · ${rule.name}`;
     const zoneIds = this.abnormalZones(mode, events);
     if (mode.triggerSeconds === 0) return this.trigger(mode.id, cause, 'Objet Matter', zoneIds);
@@ -227,13 +286,11 @@ export class Alarm {
       pendingActions = pendingActions.filter((item) => item.activationId !== previous.activationId);
     }
     const changed = previous.phase !== state.phase || !sameCycle;
-    if (changed || ['entry', 'triggered'].includes(state.phase)) {
-      const activeMode = this.record.modes.find(({ id }) => id === state.modeId);
-      let zones = state.zoneIds;
-      if (state.phase === 'exit' || state.phase === 'armed') zones = activeMode.zones;
-      else if (!changed) zones = state.zoneIds.filter((id) => !previous.zoneIds.includes(id));
-      const mode = changed ? activeMode : undefined;
-      const planned = this.planActions(state.phase, mode, zones, activationId)
+    if (changed) {
+      const modeId = state.phase === 'disarmed' ? previous.modeId : state.modeId;
+      const mode = this.record.modes.find(({ id }) => id === modeId);
+      const scenarioIds = mode?.scenarios[state.phase] ?? [];
+      const planned = this.planScenarios(scenarioIds, state.phase, activationId)
         .filter((item) => !state.actionKeys.includes(item.event + ':' + item.actionId));
       state.actionKeys = [...new Set([...state.actionKeys, ...planned.map((item) => item.event + ':' + item.actionId)])];
       pendingActions = [...pendingActions, ...planned];
@@ -242,12 +299,14 @@ export class Alarm {
     return this.commit({ ...this.record, state, pendingActions, history });
   }
 
-  planActions(event, mode, zoneIds, activationId) {
-    const zones = this.record.zones.filter(({ id }) => zoneIds.includes(id));
-    const ids = new Set(event === 'disarmed' ? this.record.disarmActions : [mode, ...zones].flatMap((item) => item?.actions?.[event] ?? []));
-    return this.record.actions.filter(({ id }) => ids.has(id)).flatMap((action) => action.operations.map((operation) => ({
-      id: randomUUID(), actionId: action.id, name: action.name, event, activationId, operation,
-    })));
+  planScenarios(scenarioIds, event, activationId) {
+    const scenarios = new Map(this.record.scenarios.map((scenario) => [scenario.id, scenario]));
+    const actions = new Map(this.record.actions.map((action) => [action.id, action]));
+    const actionIds = new Set(scenarioIds.flatMap((id) => scenarios.get(id)?.actionIds ?? []));
+    return [...actionIds].flatMap((id) => {
+      const action = actions.get(id);
+      return action ? actionJobs(action, event, activationId) : [];
+    });
   }
 
   testAction(id) {
@@ -256,9 +315,17 @@ export class Alarm {
       if (!action) return 'Action introuvable.';
       return {
         ...record,
-        pendingActions: action.operations.map((operation) => ({
-          id: randomUUID(), actionId: action.id, name: action.name, event: 'test', activationId: record.state.activationId, operation,
-        })),
+        pendingActions: actionJobs(action, 'test', record.state.activationId),
+      };
+    });
+  }
+
+  testScenario(id) {
+    return this.configure((record) => {
+      if (!record.scenarios.some((scenario) => scenario.id === id)) return 'Scénario introuvable.';
+      return {
+        ...record,
+        pendingActions: this.planScenarios([id], 'test', record.state.activationId),
       };
     });
   }
@@ -290,4 +357,14 @@ export class Alarm {
 
 export function integerIn(value, min, max) {
   return Number.isInteger(value) && value >= min && value <= max;
+}
+
+function actionJobs(action, event, activationId) {
+  return action.operations.map((operation) => ({
+    id: randomUUID(), actionId: action.id, name: action.name, event, activationId, operation,
+  }));
+}
+
+function hasSelection(items, ids) {
+  return ids.every((id) => items.some((item) => item.id === id));
 }

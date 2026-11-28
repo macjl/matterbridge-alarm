@@ -2,10 +2,15 @@ import { ContentLauncherClient, FixedLabelClient } from 'matterbridge/matter/beh
 import { ContentLauncher } from 'matterbridge/matter/clusters';
 
 const format = 'audio-profiles.v1';
-export function hasAudioProfiles(endpoint) {
-  return endpoint?.maybeStateOf(FixedLabelClient)?.labelList?.some((label) => label.label === 'audioProfiles' && label.value === 'v1')
+const masterVolumeFormat = 'audio-master-volume.v1';
+
+function hasAudioCommand(endpoint, capability) {
+  return endpoint?.maybeStateOf(FixedLabelClient)?.labelList?.some(({ label, value }) => label === capability && value === 'v1')
     && endpoint.maybeStateOf(ContentLauncherClient)?.acceptedCommandList?.includes(ContentLauncher.commands.launchContent.id);
 }
+
+export const hasAudioProfiles = (endpoint) => hasAudioCommand(endpoint, 'audioProfiles');
+export const hasAudioMasterVolume = (endpoint) => hasAudioCommand(endpoint, 'audioMaster');
 
 export async function readAudioProfiles(endpoint) {
   if (!hasAudioProfiles(endpoint)) return [];
@@ -35,4 +40,12 @@ export async function playAudioProfile(endpoint, id) {
     search: { parameterList: [{ type: ContentLauncher.Parameter.Any, value: id }] }, autoPlay: true,
   });
   if (response.status !== ContentLauncher.Status.Success) throw new Error(`Profil audio refusé (statut ${response.status}).`);
+}
+
+export async function setAudioMasterVolume(endpoint, volume) {
+  const response = await endpoint.commandsOf(ContentLauncherClient).launchContent({
+    search: { parameterList: [{ type: ContentLauncher.Parameter.Any, value: String(volume) }] },
+    autoPlay: false, data: masterVolumeFormat,
+  });
+  if (response.status !== ContentLauncher.Status.Success) throw new Error(`Volume Master refusé (statut ${response.status}).`);
 }

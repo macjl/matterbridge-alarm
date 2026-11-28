@@ -50,18 +50,3 @@ export function matchesEvent(rule, before, after) {
   if (typeof before !== 'boolean' || typeof after !== 'boolean' || before === after) return false;
   return rule.trigger === 'change' || (rule.trigger === 'rising' && after) || (rule.trigger === 'falling' && !after);
 }
-
-export function normalizeRule(rule) {
-  if (rule.signal !== undefined) return rule;
-  const source = Object.entries(sources).find(([, entry]) => entry.cluster === rule.cluster
-    && entry.attribute === rule.attribute && JSON.stringify(entry.path) === JSON.stringify(rule.path));
-  if (!source || !['eq', 'ne'].includes(rule.operator) || typeof rule.expected !== 'boolean') {
-    return { ...rule, signal: null, trigger: null };
-  }
-  const [signal, definition] = source;
-  const active = rule.operator === 'eq' ? rule.expected === definition.activeValue : rule.expected !== definition.activeValue;
-  return {
-    id: rule.id, name: rule.name, zoneIds: rule.zoneIds ?? [rule.zoneId],
-    peer: rule.peer, endpoint: rule.endpoint, signal, kind: signal, trigger: active ? 'active' : 'inactive',
-  };
-}
