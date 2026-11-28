@@ -37,6 +37,6 @@
     "test:integration": "node --test test/alarm.test.js"
   },
   "devDependencies": {
-    "jsdom": "27.0.1"
+    "jsdom": "31.0.1"
   }
 }
